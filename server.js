@@ -649,6 +649,7 @@ function mapQuestion(row, options = {}) {
     includeAnswer = false,
     userState = {},
     answerState = null,
+    scoring = null,
   } = options;
 
   const question = {
@@ -684,9 +685,9 @@ function mapQuestion(row, options = {}) {
 
     // The app uses the persisted session_answers as the source of truth
     // after submission. Keep the scoring metadata together with the result.
-    question.correctMarks = 4;
-    question.negativeMarks = 1;
-    question.skipMarks = 0;
+    question.correctMarks = scoring ? scoring.correctMarks : null;
+    question.negativeMarks = scoring ? Math.abs(scoring.wrongMarks) : null;
+    question.skipMarks = scoring ? scoring.skipMarks : null;
 
     if (answerState) {
       question.isCorrect =
@@ -1003,6 +1004,135 @@ async function queueFor(userId, sources) {
 |--------------------------------------------------------------------------
 */
 
+/*
+|--------------------------------------------------------------------------
+| Scoring patterns (admin "Mode rules" > Score patterns)
+|--------------------------------------------------------------------------
+| A pattern = marks per right answer, per wrong answer (negative) and per
+| skipped question. A session stores a copy of the marks it was started with,
+| so editing a pattern later never changes old results.
+| A session without a pattern has no marks: only accuracy is shown.
+*/
+
+function mapScoringPattern(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description || '',
+    correctMarks: Number(row.correct_marks ?? 1),
+    wrongMarks: -Math.abs(Number(row.wrong_marks ?? 0)),
+    skipMarks: Number(row.skip_marks ?? 0),
+    isActive: Boolean(row.is_active),
+    displayOrder: Number(row.display_order || 0),
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+  };
+}
+
+/**
+ * The app's "Scoring Pattern" drop-down: one entry per active exam that has a score pattern.
+ * `name` is the exam name, the marks are the exam's pattern, `isHighlighted` is the exam's
+ * "highlight this exam scoring pattern" flag (starred + listed first in the app).
+ */
+async function listExamScoringEntries() {
+  const { data: exams, error: examError } = await supabaseAdmin
+    .from('exams')
+    .select('id,name,code,display_order,is_scoring_highlighted,scoring_pattern_id')
+    .eq('is_active', true)
+    .not('scoring_pattern_id', 'is', null);
+  if (examError) throw examError;
+
+  const ids = [...new Set((exams || []).map((e) => e.scoring_pattern_id))];
+  if (!ids.length) return [];
+
+  const { data: pats, error: patError } = await supabaseAdmin
+    .from('scoring_patterns')
+    .select('*')
+    .eq('is_active', true)
+    .in('id', ids);
+  if (patError) throw patError;
+
+  const byId = new Map((pats || []).map((p) => [p.id, p]));
+  return (exams || [])
+    .filter((e) => byId.has(e.scoring_pattern_id))
+    .sort((a, b) =>
+      Number(Boolean(b.is_scoring_highlighted)) - Number(Boolean(a.is_scoring_highlighted)) ||
+      Number(a.display_order || 0) - Number(b.display_order || 0) ||
+      String(a.name || '').localeCompare(String(b.name || ''))
+    )
+    .map((e) => {
+      const p = mapScoringPattern(byId.get(e.scoring_pattern_id));
+      return {
+        id: p.id,                 // score pattern id (this is what a session stores)
+        patternName: p.name,
+        name: e.name,             // shown in the app: the exam name
+        examId: e.id,
+        examName: e.name,
+        description: p.description,
+        correctMarks: p.correctMarks,
+        wrongMarks: p.wrongMarks,
+        skipMarks: p.skipMarks,
+        isHighlighted: Boolean(e.is_scoring_highlighted),
+      };
+    });
+}
+
+/** Marks stored on a session row, or null when the session has no scoring. */
+function sessionScoring(session) {
+  if (!session || session.correct_marks === null || session.correct_marks === undefined) {
+    return null;
+  }
+  return {
+    patternId: session.scoring_pattern_id || null,
+    name: session.scoring_name || null,
+    correctMarks: Number(session.correct_marks),
+    wrongMarks: -Math.abs(Number(session.wrong_marks || 0)),
+    skipMarks: Number(session.skip_marks || 0),
+  };
+}
+
+/** Pattern for a new session: the chosen pattern id, else the exam's own pattern, else none. */
+async function resolveScoringForSession(body, setId) {
+  let patternId = optionalText(
+    bodyValue(body || {}, 'scoringPatternId', 'scoring_pattern_id', (body || {}).scoringPreset)
+  );
+
+  // The app sends 'none' when the user chose "No scoring": do not fall back to the exam's pattern.
+  if (patternId && patternId.toLowerCase() === 'none') return null;
+
+  if (!patternId) {
+    let examId = optionalText(bodyValue(body || {}, 'examId', 'exam_id'));
+    if (!examId && setId) {
+      const { data: set } = await supabaseAdmin
+        .from('sets')
+        .select('exam_id')
+        .eq('id', setId)
+        .maybeSingle();
+      examId = set?.exam_id || null;
+    }
+    if (examId) {
+      const { data: exam } = await supabaseAdmin
+        .from('exams')
+        .select('scoring_pattern_id')
+        .eq('id', examId)
+        .maybeSingle();
+      patternId = exam?.scoring_pattern_id || null;
+    }
+  }
+
+  if (!patternId) return null;
+
+  const { data: row, error: dbError } = await supabaseAdmin
+    .from('scoring_patterns')
+    .select('*')
+    .eq('id', patternId)
+    .eq('is_active', true)
+    .maybeSingle();
+
+  if (dbError) throw dbError;
+  return row || null;
+}
+
 async function loadSession(sessionId, userId) {
   const { data: session, error: sessionError } =
     await supabaseAdmin
@@ -1066,6 +1196,7 @@ async function loadSession(sessionId, userId) {
       includeAnswer,
       userState: states[row.question_id],
       answerState: answerMap[row.question_id] || null,
+      scoring: sessionScoring(session),
     }),
 
     id: row.question.id,
@@ -1103,10 +1234,14 @@ async function loadSession(sessionId, userId) {
 
     isSubmitted: session.is_submitted,
 
+    scoringPatternId: session.scoring_pattern_id || null,
+    scoring: sessionScoring(session),
+
     result:
-      session.score !== null
+      session.score !== null || session.is_submitted === true
         ? {
-            score: session.score,
+            score: session.score ?? null,
+            maxScore: session.max_score ?? null,
             percentage: Number(session.percentage || 0),
             totalQuestions: session.total_questions,
             totalCorrect: session.total_correct || 0,
@@ -1148,6 +1283,8 @@ function historyFromSession(s) {
     answeredQuestions: s.answered_questions,
 
     score: s.score ?? null,
+    maxScore: s.max_score ?? null,
+    scoringName: s.scoring_name || null,
     percentage:
       s.percentage !== null
         ? Number(s.percentage)
@@ -1225,6 +1362,8 @@ async function makeSession(
     number(body.durationSeconds, 1800)
   );
 
+  const scoringRow = await resolveScoringForSession(body, setId);
+
   const { data: session, error: sessionError } =
     await supabaseAdmin
       .from('sessions')
@@ -1242,6 +1381,12 @@ async function makeSession(
         last_activity_at: now(),
 
         duration_seconds: durationSeconds,
+
+        scoring_pattern_id: scoringRow ? scoringRow.id : null,
+        scoring_name: scoringRow ? scoringRow.name : null,
+        correct_marks: scoringRow ? Number(scoringRow.correct_marks) : null,
+        wrong_marks: scoringRow ? -Math.abs(Number(scoringRow.wrong_marks || 0)) : null,
+        skip_marks: scoringRow ? Number(scoringRow.skip_marks || 0) : null,
 
         total_questions: orderedQuestions.length,
         answered_questions: 0,
@@ -1486,11 +1631,23 @@ async function applyAnswer(
       answer != null &&
       answer === questionFull.correct_option;
 
-    const marks = answer == null
+    const { data: sessRow, error: sessRowError } =
+      await supabaseAdmin
+        .from('sessions')
+        .select('correct_marks,wrong_marks,skip_marks')
+        .eq('id', sessionId)
+        .maybeSingle();
+
+    if (sessRowError) throw sessRowError;
+
+    const sc = sessionScoring(sessRow);
+    const marks = !sc
       ? 0
-      : isCorrect
-        ? 4
-        : -1;
+      : answer == null
+        ? sc.skipMarks
+        : isCorrect
+          ? sc.correctMarks
+          : sc.wrongMarks;
 
     const { error: answerError } =
       await supabaseAdmin
@@ -1644,14 +1801,21 @@ async function submitSession(sessionId, userId) {
 
   const total = rows?.length || 0;
 
-  const score =
-    correct * 4 - wrong;
+  const sc = sessionScoring(session);
+
+  // With a scoring pattern: marks (right x correct + wrong x negative + skipped x skip).
+  // Without one there are no marks, only accuracy.
+  const round2 = (n) => Math.round(n * 100) / 100;
+  const score = sc
+    ? round2(correct * sc.correctMarks + wrong * sc.wrongMarks + unanswered * sc.skipMarks)
+    : null;
+  const maxScore = sc ? round2(total * sc.correctMarks) : null;
 
   const percentage =
     total > 0
-      ? Math.round(
-          (correct / total) * 100
-        )
+      ? sc && maxScore > 0
+        ? Math.max(0, Math.round((score / maxScore) * 10000) / 100)
+        : Math.round((correct / total) * 100)
       : 0;
 
   /*
@@ -1673,6 +1837,7 @@ async function submitSession(sessionId, userId) {
         time_spent: timeSpent,
 
         score,
+        max_score: maxScore,
         percentage,
 
         total_correct: correct,
@@ -1702,7 +1867,7 @@ async function submitSession(sessionId, userId) {
           question_id: row.question_id,
           answer: row.user_answer,
           is_correct: isCorrect,
-          marks: isCorrect ? 4 : -1,
+          marks: sc ? (isCorrect ? sc.correctMarks : sc.wrongMarks) : 0,
           answered_at: now(),
         },
         {
@@ -1925,15 +2090,16 @@ app.get('/auth/me', auth, async (req, res) => {
 
 app.get('/api/admin/form-options', adminAuth, async (req, res) => {
   try {
-    const [examsResult, subjectsResult, taxonomyResult, setsResult, questionsResult] = await Promise.all([
+    const [examsResult, subjectsResult, taxonomyResult, setsResult, questionsResult, patternsResult] = await Promise.all([
       supabaseAdmin.from('exams').select('id,name,code').eq('is_active', true).order('display_order', { ascending: true }),
       supabaseAdmin.from('subjects').select('id,name,exam_id').order('display_order', { ascending: true }).order('name', { ascending: true }),
       supabaseAdmin.from('taxonomy_nodes').select('id,name,node_type,subject_id,exam_id,parent_id').order('display_order', { ascending: true }).order('name', { ascending: true }),
       supabaseAdmin.from('sets').select('id,name,exam_id,subject_id,year,set_type,is_published').order('created_at', { ascending: false }).limit(500),
       supabaseAdmin.from('questions').select('id,question_id,stem,exam_id,subject_id,topic_id').order('created_at', { ascending: false }).limit(1000),
+      supabaseAdmin.from('scoring_patterns').select('*').eq('is_active', true).order('display_order', { ascending: true }).order('name', { ascending: true }),
     ]);
-    for (const r of [examsResult, subjectsResult, taxonomyResult, setsResult, questionsResult]) if (r.error) throw r.error;
-    return response(res, { exams: examsResult.data || [], subjects: subjectsResult.data || [], taxonomy: taxonomyResult.data || [], sets: setsResult.data || [], questions: questionsResult.data || [] });
+    for (const r of [examsResult, subjectsResult, taxonomyResult, setsResult, questionsResult, patternsResult]) if (r.error) throw r.error;
+    return response(res, { exams: examsResult.data || [], subjects: subjectsResult.data || [], taxonomy: taxonomyResult.data || [], sets: setsResult.data || [], questions: questionsResult.data || [], scoringPatterns: (patternsResult.data || []).map(mapScoringPattern) });
   } catch (e) {
     return adminFail(res, e, 'admin_form_options_error', 500);
   }
@@ -2120,6 +2286,8 @@ function mapExam(row) {
     freeSets: Number(row.free_sets || 0),
     iconUrl: row.icon_url || null,
     bannerUrl: row.banner_url || null,
+    scoringPatternId: row.scoring_pattern_id || null,
+    isScoringHighlighted: Boolean(row.is_scoring_highlighted),
     createdAt: row.created_at || null,
     updatedAt: row.updated_at || null,
   };
@@ -3099,7 +3267,15 @@ app.post('/api/admin/exams', adminAuth, async (req, res) => {
       free_sets: 0,
       icon_url: optionalText(bodyValue(body, 'iconUrl', 'icon_url')),
       banner_url: optionalText(bodyValue(body, 'bannerUrl', 'banner_url')),
+      scoring_pattern_id: await validScoringPatternId(
+        bodyValue(body, 'scoringPatternId', 'scoring_pattern_id')
+      ),
+      is_scoring_highlighted: parseBoolean(
+        bodyValue(body, 'isScoringHighlighted', 'is_scoring_highlighted', false)
+      ),
     };
+
+    if (payload.is_scoring_highlighted) await assertExamHighlightRoom(null);
 
     const { data, error: dbError } = await supabaseAdmin
       .from('exams')
@@ -3182,6 +3358,19 @@ app.patch('/api/admin/exams/:id', adminAuth, async (req, res) => {
     }
     if (body.bannerUrl !== undefined || body.banner_url !== undefined) {
       update.banner_url = optionalText(bodyValue(body, 'bannerUrl', 'banner_url'));
+    }
+    if (body.isScoringHighlighted !== undefined || body.is_scoring_highlighted !== undefined) {
+      update.is_scoring_highlighted = parseBoolean(
+        bodyValue(body, 'isScoringHighlighted', 'is_scoring_highlighted')
+      );
+      if (update.is_scoring_highlighted && !existing.is_scoring_highlighted) {
+        await assertExamHighlightRoom(resolvedExamId);
+      }
+    }
+    if (body.scoringPatternId !== undefined || body.scoring_pattern_id !== undefined) {
+      update.scoring_pattern_id = await validScoringPatternId(
+        bodyValue(body, 'scoringPatternId', 'scoring_pattern_id')
+      );
     }
     if (body.isActive !== undefined || body.is_active !== undefined) {
       update.is_active = parseBoolean(bodyValue(body, 'isActive', 'is_active'));
@@ -5399,6 +5588,140 @@ app.patch('/api/admin/mode-rules/:id', adminAuth, async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------
+// ADMIN - MODE RULES > SCORE PATTERNS
+// Marks per right answer, per wrong answer (negative) and per skipped question.
+// An exam picks one of these patterns (exams.scoring_pattern_id). Up to
+// Highlighting is done per EXAM (exam form: "Highlight this exam scoring pattern"), max MAX_HIGHLIGHTED_EXAMS.
+// ---------------------------------------------------------
+const MAX_HIGHLIGHTED_EXAMS = 5;
+
+async function validScoringPatternId(value) {
+  const id = optionalText(value);
+  if (!id) return null; // "not applied"
+  await assertExists('scoring_patterns', 'id', id, 'Score pattern');
+  return id;
+}
+
+async function assertExamHighlightRoom(exceptExamId) {
+  let query = supabaseAdmin
+    .from('exams')
+    .select('id', { count: 'exact', head: true })
+    .eq('is_scoring_highlighted', true);
+  if (exceptExamId) query = query.neq('id', exceptExamId);
+  const { count, error: dbError } = await query;
+  if (dbError) throw dbError;
+  if (Number(count || 0) >= MAX_HIGHLIGHTED_EXAMS) {
+    const err = new Error(`You can highlight at most ${MAX_HIGHLIGHTED_EXAMS} exam scoring patterns. Remove a highlight from another exam first.`);
+    err.status = 400;
+    err.code = 'too_many_highlighted_exams';
+    throw err;
+  }
+}
+
+function scoringPatternPayload(body, partial) {
+  const out = {};
+  const has = (a, b) => body[a] !== undefined || body[b] !== undefined;
+  if (!partial || body.name !== undefined) out.name = requiredText(body.name, 'name');
+  if (!partial || body.description !== undefined) out.description = optionalText(body.description);
+  if (!partial || has('correctMarks', 'correct_marks')) {
+    const n = nullableNumber(bodyValue(body, 'correctMarks', 'correct_marks'));
+    if (n === null || n <= 0) {
+      const err = new Error('correctMarks must be a number greater than 0.');
+      err.status = 400;
+      err.code = 'invalid_correct_marks';
+      throw err;
+    }
+    out.correct_marks = n;
+  }
+  if (!partial || has('wrongMarks', 'wrong_marks')) {
+    const n = nullableNumber(bodyValue(body, 'wrongMarks', 'wrong_marks'), 0);
+    out.wrong_marks = Math.abs(n); // stored positive, applied as a deduction
+  }
+  if (!partial || has('skipMarks', 'skip_marks')) {
+    out.skip_marks = nullableNumber(bodyValue(body, 'skipMarks', 'skip_marks'), 0);
+  }
+  if (!partial || has('isActive', 'is_active')) {
+    out.is_active = parseBoolean(bodyValue(body, 'isActive', 'is_active', true), true);
+  }
+  if (!partial || has('displayOrder', 'display_order')) {
+    out.display_order = number(bodyValue(body, 'displayOrder', 'display_order', 0));
+  }
+  return out;
+}
+
+app.get('/api/admin/mode-rules/scoring-patterns', adminAuth, async (req, res) => {
+  try {
+    const { data, error: dbError } = await supabaseAdmin
+      .from('scoring_patterns')
+      .select('*')
+      .order('display_order', { ascending: true })
+      .order('name', { ascending: true });
+    if (dbError) throw dbError;
+    return response(res, {
+      patterns: (data || []).map(mapScoringPattern),
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_scoring_patterns_error', 500);
+  }
+});
+
+app.post('/api/admin/mode-rules/scoring-patterns', adminAuth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const payload = scoringPatternPayload(body, false);
+    payload.id = await generatedTextId('scoring_patterns', payload.name, 'score');
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('scoring_patterns')
+      .insert(payload)
+      .select('*')
+      .single();
+    if (dbError) throw dbError;
+    return response(res, { pattern: mapScoringPattern(data) }, 201);
+  } catch (e) {
+    return adminFail(res, e, 'admin_scoring_pattern_create_error');
+  }
+});
+
+app.patch('/api/admin/mode-rules/scoring-patterns/:id', adminAuth, async (req, res) => {
+  try {
+    const existing = await assertExists('scoring_patterns', 'id', req.params.id, 'Score pattern');
+    const update = scoringPatternPayload(req.body || {}, true);
+    ensureNonEmptyUpdate(update);
+    update.updated_at = now();
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('scoring_patterns')
+      .update(update)
+      .eq('id', req.params.id)
+      .select('*')
+      .limit(1)
+      .maybeSingle();
+    if (dbError) throw dbError;
+    requireUpdatedRow(data, 'Score pattern');
+    return response(res, { pattern: mapScoringPattern(data) });
+  } catch (e) {
+    return adminFail(res, e, 'admin_scoring_pattern_update_error');
+  }
+});
+
+app.delete('/api/admin/mode-rules/scoring-patterns/:id', adminAuth, async (req, res) => {
+  try {
+    await assertExists('scoring_patterns', 'id', req.params.id, 'Score pattern');
+    // exams.scoring_pattern_id and sessions.scoring_pattern_id are ON DELETE SET NULL
+    // (old results keep their own copy of the marks).
+    const { error: dbError } = await supabaseAdmin
+      .from('scoring_patterns')
+      .delete()
+      .eq('id', req.params.id);
+    if (dbError) throw dbError;
+    return response(res, { deleted: true, id: req.params.id });
+  } catch (e) {
+    return adminFail(res, e, 'admin_scoring_pattern_delete_error');
+  }
+});
+
 app.delete('/api/admin/mode-rules/:id', adminAuth, async (req, res) => {
   try {
     await assertExists('mode_rules', 'id', req.params.id, 'Mode rule');
@@ -5729,6 +6052,8 @@ app.get(
           freeSets: row.free_sets,
           iconUrl: row.icon_url || null,
           bannerUrl: row.banner_url || null,
+          scoringPatternId: row.scoring_pattern_id || null,
+          isScoringHighlighted: Boolean(row.is_scoring_highlighted),
         })
       );
 
@@ -6381,6 +6706,25 @@ app.get(
 
 /*
 |--------------------------------------------------------------------------
+| SCORING PATTERNS (user app: "Scoring Pattern" drop-down)
+|--------------------------------------------------------------------------
+| Active patterns, highlighted ones first (the app shows a star on them).
+*/
+
+app.get(
+  '/api/scoring-patterns',
+  async (req, res) => {
+    try {
+      // one entry per exam that has a score pattern; starred (highlighted) exams first
+      return response(res, { patterns: await listExamScoringEntries() });
+    } catch (e) {
+      return error(res, 500, e.message, 'scoring_patterns_error');
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
 | MODE RULES
 |--------------------------------------------------------------------------
 */
@@ -6888,16 +7232,10 @@ app.post(
           })
         ),
 
-        examStrategies: [
-          {
-            id: 'balanced',
-            code: 'BALANCED',
-            name: 'Balanced',
-            correctMarks: 4,
-            wrongMarks: -1,
-            skipMarks: 0,
-          },
-        ],
+        examStrategies: (await listExamScoringEntries()).map((r) => ({
+          ...r,
+          code: String(r.examName || '').toUpperCase().replace(/[^A-Z0-9]+/g, '_'),
+        })),
 
         taxonomyNodes,
 
