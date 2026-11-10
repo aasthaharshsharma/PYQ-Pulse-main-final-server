@@ -5687,6 +5687,14 @@ app.get('/api/admin/draft-questions', adminAuth, async (req, res) => {
       summary: { all: total ?? 0, ready: readyCount ?? 0, review: Math.max(0, (total ?? 0) - (readyCount ?? 0)) },
     });
   } catch (e) {
+    console.error('[DRAFT QUESTIONS LIST ERROR]', {
+      message: e?.message,
+      code: e?.code,
+      details: e?.details,
+      hint: e?.hint,
+      stack: e?.stack,
+    });
+
     return draftFail(res, e, 'admin_drafts_list_error');
   }
 });
