@@ -130,6 +130,26 @@ app.use(
 );
 
 app.use(express.json({ limit: '1mb' }));
+
+// Maintenance mode (Admin > Site Controls). User APIs answer 503 while it is on;
+// admin APIs, login/refresh, /api/app-config and /health keep working.
+app.use(async (req, res, next) => {
+  const path = req.path || '';
+  if (!path.startsWith('/api/') || path.startsWith('/api/admin') || path === '/api/app-config') {
+    return next();
+  }
+  try {
+    const state = await maintenanceState();
+    if (!state.on) return next();
+    return res.status(503).json({
+      success: false,
+      message: state.message,
+      code: 'maintenance_mode',
+    });
+  } catch (_) {
+    return next();
+  }
+});
 app.use(morgan('dev'));
 
 /*
@@ -615,10 +635,204 @@ async function adminAuth(req, res, next) {
       return error(res, 403, 'Admin access required.', 'admin_forbidden');
     }
 
-    return next();
+    return auditAdminRequest(req, res, next);
   });
 }
 
+/*
+|--------------------------------------------------------------------------
+| Audit logs (admin panel > Audit Logs)
+|--------------------------------------------------------------------------
+| Every admin change (POST / PATCH / PUT / DELETE under /api/admin) is written to
+| `audit_logs` after the response is sent: who, what, which record, success or failure and,
+| for updates, which fields changed (from -> to). Writing a log can never break a request.
+*/
+
+// path segment after /api/admin/  ->  [entity label, table]
+const AUDIT_ENTITIES = {
+  exams: ['exam', 'exams'],
+  subjects: ['subject', 'subjects'],
+  taxonomy: ['taxonomy node', 'taxonomy_nodes'],
+  sets: ['set', 'sets'],
+  questions: ['question', 'questions'],
+  banners: ['banner', 'banners'],
+  'subscription-plans': ['subscription plan', 'subscription_plans'],
+  'market-products': ['market product', 'market_products'],
+  'mode-rules': ['mode rule', 'mode_rules'],
+  'app-config': ['app setting', 'app_config'],
+  media: ['media upload', null],
+  'site-controls': ['site controls', '__site_controls'],
+  'draft-questions': ['draft question', 'draft_questions'],
+};
+
+const AUDIT_SKIP_COLUMNS = new Set(['updated_at', 'created_at']);
+const AUDIT_SECRET_KEY = /(secret|token|password|passwd|api[_-]?key|authorization)/i;
+
+function auditTarget(req) {
+  const parts = String(req.originalUrl || req.url || '').split('?')[0].split('/').filter(Boolean);
+  // ['api','admin', segment, id?, sub?, subId?]
+  let segment = parts[2] || '';
+  let idIndex = 3;
+  if (segment === 'mode-rules' && parts[3] === 'scoring-patterns') {
+    return { label: 'score pattern', table: 'scoring_patterns', entityId: parts[4] ? decodeURIComponent(parts[4]) : null };
+  }
+  const known = AUDIT_ENTITIES[segment];
+  if (segment === 'site-controls') return { label: known[0], table: known[1], entityId: 'site_controls', sub: null };
+  const entityId = parts[idIndex] ? decodeURIComponent(parts[idIndex]) : null;
+  const sub = parts[4] || null; // e.g. sets/:id/questions
+  if (!known) return { label: segment.replace(/-/g, ' ') || 'record', table: null, entityId, sub };
+  return { label: known[0], table: known[1], entityId, sub };
+}
+
+function auditClean(value, depth = 0) {
+  if (value === null || value === undefined) return value;
+  if (typeof value === 'string') return value.length > 300 ? `${value.slice(0, 300)}...` : value;
+  if (typeof value !== 'object') return value;
+  if (depth > 2) return '[object]';
+  if (Array.isArray(value)) return value.slice(0, 20).map((v) => auditClean(v, depth + 1));
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    out[k] = AUDIT_SECRET_KEY.test(k) ? '[hidden]' : auditClean(v, depth + 1);
+  }
+  return out;
+}
+
+async function auditFetchRow(table, id) {
+  if (!table || !id) return null;
+  if (table === '__site_controls') return readSiteControlRows();
+  try {
+    let { data } = await supabaseAdmin.from(table).select('*').eq('id', id).limit(1).maybeSingle();
+    if (!data && table === 'exams') {
+      ({ data } = await supabaseAdmin.from('exams').select('*').eq('code', id).limit(1).maybeSingle());
+    }
+    if (!data && table === 'app_config') {
+      ({ data } = await supabaseAdmin.from('app_config').select('*').eq('key', id).limit(1).maybeSingle());
+    }
+    return data || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function auditDiff(before, after) {
+  const changes = {};
+  if (!before || !after) return changes;
+  for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
+    if (AUDIT_SKIP_COLUMNS.has(key)) continue;
+    const a = JSON.stringify(before[key] ?? null);
+    const b = JSON.stringify(after[key] ?? null);
+    if (a !== b) {
+      changes[key] = AUDIT_SECRET_KEY.test(key)
+        ? { from: '[hidden]', to: '[hidden]' }
+        : { from: auditClean(before[key] ?? null), to: auditClean(after[key] ?? null) };
+    }
+  }
+  return changes;
+}
+
+function auditRowLabel(row) {
+  if (!row) return '';
+  const v = row.name ?? row.title ?? row.stem ?? row.key ?? row.code ?? row.question_id ?? '';
+  const text = String(v).replace(/\s+/g, ' ').trim();
+  return text.length > 70 ? `${text.slice(0, 70)}...` : text;
+}
+
+// Last failure while writing a log (shown on the Audit Logs page so problems are visible).
+let auditLastWriteError = null;
+
+async function auditInsert(row) {
+  const { error: insertError } = await supabaseAdmin.from('audit_logs').insert(row);
+  if (insertError) {
+    auditLastWriteError = {
+      message: insertError.message || String(insertError),
+      code: insertError.code || null,
+      hint: insertError.hint || null,
+      at: now(),
+    };
+    console.error('[AUDIT LOG INSERT FAILED]', insertError.message || insertError);
+    return false;
+  }
+  auditLastWriteError = null;
+  return true;
+}
+
+async function auditAdminRequest(req, res, next) {
+  try {
+    const method = req.method;
+    if (!['POST', 'PATCH', 'PUT', 'DELETE'].includes(method)) return next();
+
+    const target = auditTarget(req);
+    const started = Date.now();
+    let captured = null;
+    const origJson = res.json.bind(res);
+    res.json = (body) => {
+      captured = body;
+      return origJson(body);
+    };
+
+    // the record as it was before the change (updates and deletes)
+    const before = method === 'POST' ? null : await auditFetchRow(target.table, target.entityId);
+
+    res.on('finish', async () => {
+      try {
+        const ok = res.statusCode < 400;
+        let after = null;
+        let entityId = target.entityId;
+        if (ok && method !== 'DELETE') {
+          if (method === 'POST' && !target.sub) {
+            const payload = captured?.data || {};
+            const made = Object.values(payload).find((v) => v && typeof v === 'object' && !Array.isArray(v) && v.id);
+            entityId = made?.id || entityId;
+          }
+          entityId = res.locals?.auditEntityId || entityId;
+          after = await auditFetchRow(target.table, entityId);
+        }
+
+        const changes = method === 'PATCH' ? auditDiff(before, after) : {};
+        const label = auditRowLabel(after) || auditRowLabel(before);
+        const verb = method === 'POST' ? 'Created' : method === 'DELETE' ? 'Deleted' : 'Updated';
+        const action = method === 'POST' ? 'create' : method === 'DELETE' ? 'delete' : 'update';
+        const changedNames = Object.keys(changes);
+        const subText = target.sub ? ` (${target.sub.replace(/-/g, ' ')})` : '';
+        let summary = `${ok ? verb : `Failed to ${verb.toLowerCase().replace(/d$/, '')}`} ${target.label}${label ? ` "${label}"` : ''}${subText}`;
+        if (ok && changedNames.length) summary += ` - ${changedNames.slice(0, 6).join(', ')}${changedNames.length > 6 ? ` +${changedNames.length - 6} more` : ''}`;
+        // A route can describe itself better (bulk draft actions etc.)
+        const override = ok ? res.locals?.audit : null;
+        if (override?.summary) summary = override.summary;
+        if (override?.entityId !== undefined) entityId = override.entityId;
+
+        const details = {};
+        if (changedNames.length) details.changes = changes;
+        if (method === 'POST' && after) details.after = auditClean(after);
+        if (method === 'DELETE' && before) details.before = auditClean(before);
+
+        await auditInsert({
+          admin_id: req.user?.id || null,
+          admin_email: req.user?.email || null,
+          action: (ok && res.locals?.audit?.action) || (target.sub ? 'update' : action),
+          method,
+          entity_type: target.label,
+          entity_id: entityId || null,
+          summary,
+          path: String(req.originalUrl || req.url || '').split('?')[0],
+          status_code: res.statusCode,
+          success: ok,
+          error_message: ok ? null : String(captured?.message || captured?.error || '').slice(0, 500) || null,
+          details: Object.keys(details).length ? details : null,
+          ip: String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim() || null,
+          user_agent: String(req.headers['user-agent'] || '').slice(0, 300) || null,
+          duration_ms: Date.now() - started,
+        });
+      } catch (e) {
+        auditLastWriteError = { message: e?.message || String(e), code: null, hint: null, at: now() };
+        console.error('[AUDIT LOG WRITE FAILED]', e?.message || e);
+      }
+    });
+  } catch (e) {
+    console.error('[AUDIT LOG SETUP FAILED]', e?.message || e);
+  }
+  return next();
+}
 
 /*
 |--------------------------------------------------------------------------
@@ -2671,10 +2885,50 @@ function mapProduct(row) {
     discountPercent: row.sale_price !== null && row.mrp !== null && Number(row.mrp) > 0 ? Math.max(0, Math.round((1 - Number(row.sale_price) / Number(row.mrp)) * 100)) : null,
     offerLabel: row.sale_price !== null && row.mrp !== null && Number(row.mrp) > 0 ? `${Math.max(0, Math.round((1 - Number(row.sale_price) / Number(row.mrp)) * 100))}% OFF` : null,
     imageUrl: row.image_url || null,
-    imageUrls: row.image_url ? [row.image_url] : [],
+    secondImageUrl: row.image_url_2 || null,
+    thirdImageUrl: row.image_url_3 || null,
+    fourthImageUrl: row.image_url_4 || null,
+    imageUrls: [row.image_url, row.image_url_2, row.image_url_3, row.image_url_4].filter(Boolean),
+    // product page (app): badge, duration, rating, subject, pack size, access note
+    badge: row.badge || null,
+    durationLabel: row.duration_label || null,
+    rating: row.rating === null || row.rating === undefined ? null : Number(row.rating),
+    ratingCount: Number(row.rating_count || 0),
+    subjectLabel: row.subject_label || null,
+    packSize: row.pack_size || null,
+    accessNote: row.access_note || null,
+    displayOrder: Number(row.display_order || 0),
     createdAt: row.created_at || null,
     updatedAt: row.updated_at || null,
   };
+}
+
+/** Product page / grid fields shared by admin create and update. */
+function productExtraPayload(body, partial) {
+  const out = {};
+  const has = (a, b) => body[a] !== undefined || (b && body[b] !== undefined);
+  const text = (camel, snake, col) => {
+    if (!partial || has(camel, snake)) out[col] = optionalText(bodyValue(body, camel, snake));
+  };
+  text('badge', 'badge', 'badge');
+  text('durationLabel', 'duration_label', 'duration_label');
+  text('subjectLabel', 'subject_label', 'subject_label');
+  text('packSize', 'pack_size', 'pack_size');
+  text('accessNote', 'access_note', 'access_note');
+  text('secondImageUrl', 'image_url_2', 'image_url_2');
+  text('thirdImageUrl', 'image_url_3', 'image_url_3');
+  text('fourthImageUrl', 'image_url_4', 'image_url_4');
+  if (!partial || has('rating')) {
+    const r = nullableNumber(bodyValue(body, 'rating', 'rating'));
+    out.rating = r === null ? null : Math.min(5, Math.max(0, Math.round(r * 10) / 10));
+  }
+  if (!partial || has('ratingCount', 'rating_count')) {
+    out.rating_count = Math.max(0, Math.floor(nullableNumber(bodyValue(body, 'ratingCount', 'rating_count'), 0) || 0));
+  }
+  if (!partial || has('displayOrder', 'display_order')) {
+    out.display_order = Math.floor(nullableNumber(bodyValue(body, 'displayOrder', 'display_order'), 0) || 0);
+  }
+  return out;
 }
 
 function mapModeRule(row) {
@@ -2937,6 +3191,51 @@ async function generatedTextId(table, base, prefix = 'item') {
   return `${candidate}-${crypto.randomBytes(3).toString('hex')}`.slice(0, 120);
 }
 
+// Optional admin-typed id (create) / new id (rename). Returns null when empty.
+function customRecordId(value, label) {
+  const raw = value === undefined || value === null ? '' : String(value).trim();
+  if (!raw) return null;
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{1,118}$/.test(raw)) {
+    const err = new Error(`${label} may only contain letters, numbers, dashes and underscores (2-119 characters).`);
+    err.status = 400;
+    err.code = 'invalid_id';
+    throw err;
+  }
+  return raw;
+}
+
+async function assertIdFree(table, id, label) {
+  const { data, error: lookupError } = await supabaseAdmin.from(table).select('id').eq('id', id).limit(1).maybeSingle();
+  if (lookupError) throw lookupError;
+  if (data) {
+    const err = new Error(`${label} "${id}" is already in use. Choose a different ID.`);
+    err.status = 409;
+    err.code = 'id_taken';
+    throw err;
+  }
+}
+
+// Renames a primary key and every reference to it (see sql/2026-11-editable-ids.sql).
+async function renameRecordId(table, oldId, newId, label) {
+  if (newId === oldId) return oldId;
+  await assertIdFree(table, newId, label);
+  const { error: rpcError } = await supabaseAdmin.rpc('admin_rename_id', {
+    p_table: table,
+    p_old: oldId,
+    p_new: newId,
+  });
+  if (rpcError) {
+    if (/admin_rename_id/.test(rpcError.message || '') && /(find|exist|schema cache)/i.test(rpcError.message || '')) {
+      const err = new Error('ID rename is not set up yet. Run sql/2026-11-editable-ids.sql in Supabase first.');
+      err.status = 500;
+      err.code = 'rename_not_installed';
+      throw err;
+    }
+    throw rpcError;
+  }
+  return newId;
+}
+
 function questionPayload(body = {}) {
   const questionId = bodyValue(body, 'questionId', 'question_id');
   const stem = bodyValue(body, 'stem');
@@ -3030,10 +3329,10 @@ function setPayload(body = {}) {
     set_type: String(
       bodyValue(body, 'setType', 'set_type', 'PYQ')
     ),
-    year: nullableNumber(
-      bodyValue(body, 'year'),
-      null
-    ),
+    year:
+      String(bodyValue(body, 'setType', 'set_type', 'PYQ')).toUpperCase() === 'MOCK'
+        ? null
+        : nullableNumber(bodyValue(body, 'year'), null),
     total_questions: 0,
     is_free: Boolean(
       bodyValue(body, 'isFree', 'is_free', false)
@@ -3254,7 +3553,7 @@ app.post('/api/admin/exams', adminAuth, async (req, res) => {
     const name = requiredText(bodyValue(body, 'name'), 'name');
 
     const payload = {
-      id: await generatedTextId('exams', name, 'exam'),
+      id: customRecordId(bodyValue(body, 'id'), 'Exam ID') || (await generatedTextId('exams', name, 'exam')),
       name,
       code: optionalText(bodyValue(body, 'code')),
       short_name: optionalText(bodyValue(body, 'shortName', 'short_name')),
@@ -3276,6 +3575,7 @@ app.post('/api/admin/exams', adminAuth, async (req, res) => {
     };
 
     if (payload.is_scoring_highlighted) await assertExamHighlightRoom(null);
+    await assertIdFree('exams', payload.id, 'Exam ID');
 
     const { data, error: dbError } = await supabaseAdmin
       .from('exams')
@@ -3338,6 +3638,14 @@ app.patch('/api/admin/exams/:id', adminAuth, async (req, res) => {
     const body = req.body || {};
     const update = {};
 
+    const wantedExamId = customRecordId(bodyValue(body, 'newId', 'new_id'), 'Exam ID');
+    let examRenamed = false;
+    if (wantedExamId && wantedExamId !== resolvedExamId) {
+      resolvedExamId = await renameRecordId('exams', resolvedExamId, wantedExamId, 'Exam ID');
+      res.locals.auditEntityId = resolvedExamId;
+      examRenamed = true;
+    }
+
     if (
       body.name !== undefined ||
       body.examName !== undefined ||
@@ -3382,7 +3690,7 @@ app.patch('/api/admin/exams/:id', adminAuth, async (req, res) => {
       update.display_order = number(bodyValue(body, 'displayOrder', 'display_order', 0));
     }
 
-    if (!Object.keys(update).length) {
+    if (!Object.keys(update).length && !examRenamed) {
       return error(res, 400, 'No fields supplied for update.', 'empty_update');
     }
 
@@ -3937,7 +4245,10 @@ app.post('/api/admin/sets', adminAuth, async (req, res) => {
   try {
     const body = req.body || {};
     const payload = setPayload(body);
-    const id = await generatedTextId('sets', `${payload.exam_id}-${payload.name}-${payload.year || ''}`, 'set');
+    const id =
+      customRecordId(bodyValue(body, 'id'), 'Set ID') ||
+      (await generatedTextId('sets', `${payload.exam_id}-${payload.name}${payload.year ? '-' + payload.year : ''}`, 'set'));
+    await assertIdFree('sets', id, 'Set ID');
 
     const exam = await assertExists('exams', 'id', payload.exam_id, 'Exam');
     if (!payload.exam_name) payload.exam_name = exam.name;
@@ -3983,9 +4294,16 @@ app.post('/api/admin/sets', adminAuth, async (req, res) => {
 
 app.patch('/api/admin/sets/:id', adminAuth, async (req, res) => {
   try {
-    const current = await assertExists('sets', 'id', req.params.id, 'Set');
+    let current = await assertExists('sets', 'id', req.params.id, 'Set');
     const body = req.body || {};
     const update = {};
+    let setId = req.params.id;
+
+    const wantedSetId = customRecordId(bodyValue(body, 'newId', 'new_id'), 'Set ID');
+    if (wantedSetId && wantedSetId !== setId) {
+      setId = await renameRecordId('sets', setId, wantedSetId, 'Set ID');
+      res.locals.auditEntityId = setId;
+    }
 
     if (
       body.name !== undefined ||
@@ -4017,6 +4335,9 @@ app.patch('/api/admin/sets/:id', adminAuth, async (req, res) => {
       update.set_type = String(bodyValue(body, 'setType', 'set_type'));
     }
     if (body.year !== undefined) update.year = nullableNumber(body.year);
+    if (String(update.set_type ?? current.set_type ?? '').toUpperCase() === 'MOCK') {
+      update.year = null; // mock sets never have a year
+    }
     if (body.isFree !== undefined || body.is_free !== undefined) {
       update.is_free = parseBoolean(bodyValue(body, 'isFree', 'is_free'));
     }
@@ -4034,29 +4355,29 @@ app.patch('/api/admin/sets/:id', adminAuth, async (req, res) => {
       const { error: dbError } = await supabaseAdmin
         .from('sets')
         .update(update)
-        .eq('id', req.params.id);
+        .eq('id', setId);
 
       if (dbError) throw dbError;
     }
 
     if (hasQuestionIds) {
-      await replaceSetQuestions(req.params.id, body.questionIds);
+      await replaceSetQuestions(setId, body.questionIds);
     }
 
-    if (!Object.keys(update).length && !hasQuestionIds) {
+    if (!Object.keys(update).length && !hasQuestionIds && !(wantedSetId && wantedSetId === setId)) {
       ensureNonEmptyUpdate(update);
     }
 
     const examIds = [current.exam_id];
     if (update.exam_id) examIds.push(update.exam_id);
 
-    await refreshSetCount(req.params.id);
+    await refreshSetCount(setId);
     await refreshExamCounts(examIds);
 
     const { data, error: dbError } = await supabaseAdmin
       .from('sets')
       .select('*')
-      .eq('id', req.params.id)
+      .eq('id', setId)
       .single();
 
     if (dbError) throw dbError;
@@ -4178,9 +4499,10 @@ app.get('/api/admin/questions/:id', adminAuth, async (req, res) => {
 });
 
 
-app.post('/api/admin/questions', adminAuth, async (req, res) => {
-  try {
-    const body = req.body || {};
+// Creates one live question (with mappings, sets and counts). Used by the
+// create endpoint and when a draft question is uploaded.
+async function createQuestionFromBody(body = {}) {
+  {
     const payload = questionPayload(body);
 
     const examIds    = pickIds(body, 'examIds',    'examId');
@@ -4236,8 +4558,8 @@ app.post('/api/admin/questions', adminAuth, async (req, res) => {
 
     // sourceSetId linking + counts refresh
     try {
-      if (req.body?.sourceSetId) {
-        const sourceSetId = String(req.body.sourceSetId);
+      if (body.sourceSetId) {
+        const sourceSetId = String(body.sourceSetId);
         await assertExists('sets', 'id', sourceSetId, 'Set');
 
         const { data: last, error: lastError } = await supabaseAdmin
@@ -4281,29 +4603,23 @@ app.post('/api/admin/questions', adminAuth, async (req, res) => {
       maps.sets = await loadQuestionSets([data.id]);
     } catch (_) {}
 
-    return response(res, {
-      question: mapQuestionAdminWithMappings(data, maps),
-    }, 201);
+    return mapQuestionAdminWithMappings(data, maps);
+  }
+}
+
+app.post('/api/admin/questions', adminAuth, async (req, res) => {
+  try {
+    const question = await createQuestionFromBody(req.body || {});
+    return response(res, { question }, 201);
   } catch (e) {
     return adminFail(res, e, 'admin_question_create_error');
   }
 });
 
 
-app.post('/api/admin/questions/bulk', adminAuth, async (req, res) => {
-  try {
-    const items = Array.isArray(req.body)
-      ? req.body
-      : (Array.isArray(req.body?.questions) ? req.body.questions : []);
-
-    if (!items.length) {
-      return error(res, 400, 'questions array is required.', 'questions_required');
-    }
-
-    if (items.length > 500) {
-      return error(res, 400, 'Maximum 500 questions per request.', 'bulk_limit');
-    }
-
+// Creates many live questions in one insert (mappings, sets, counts; rolls back on failure).
+async function bulkCreateQuestions(items) {
+  {
     // ---- Build payloads (is_active default handled by questionPayload) ----
     const payloads = items.map(questionPayload);
 
@@ -4469,10 +4785,26 @@ app.post('/api/admin/questions/bulk', adminAuth, async (req, res) => {
       maps.sets = await loadQuestionSets(insertedIds);
     } catch (_) {}
 
-    return response(res, {
-      count: data.length,
-      questions: data.map((row) => mapQuestionAdminWithMappings(row, maps)),
-    }, 201);
+    return { count: data.length, questions: data.map((row) => mapQuestionAdminWithMappings(row, maps)) };
+  }
+}
+
+app.post('/api/admin/questions/bulk', adminAuth, async (req, res) => {
+  try {
+    const items = Array.isArray(req.body)
+      ? req.body
+      : (Array.isArray(req.body?.questions) ? req.body.questions : []);
+
+    if (!items.length) {
+      return error(res, 400, 'questions array is required.', 'questions_required');
+    }
+
+    if (items.length > 500) {
+      return error(res, 400, 'Maximum 500 questions per request.', 'bulk_limit');
+    }
+
+    const result = await bulkCreateQuestions(items);
+    return response(res, result, 201);
   } catch (e) {
     return adminFail(res, e, 'admin_questions_bulk_create_error');
   }
@@ -5107,6 +5439,575 @@ app.delete('/api/admin/app-config/:key', adminAuth, async (req, res) => {
 });
 
 // =========================================================
+// ADMIN - DRAFT QUESTIONS (sql/2026-11-draft-questions.sql)
+// =========================================================
+// New questions (single create + bulk import) are saved here first.
+// They are not visible anywhere in the app until "Upload" turns them into
+// live questions through the same code the normal create/bulk endpoints use.
+
+const DRAFT_TEXT_KEYS = ['questionId', 'stem', 'questionType', 'correctOption', 'explanation', 'imageUrl'];
+const DRAFT_ID_KEYS = ['examIds', 'subjectIds', 'topicIds', 'setIds'];
+
+function draftIdList(value) {
+  const list = Array.isArray(value) ? value : value ? [value] : [];
+  return [...new Set(list.map((x) => (x && typeof x === 'object' ? x.id ?? x.value : x)).filter(Boolean).map(String))];
+}
+
+// Keeps only the fields the question create endpoint understands.
+function draftPayload(body = {}, base = {}) {
+  const out = { ...base };
+  for (const key of DRAFT_TEXT_KEYS) {
+    if (body[key] !== undefined) out[key] = body[key] === null ? null : String(body[key]);
+  }
+  for (const key of DRAFT_ID_KEYS) {
+    if (body[key] !== undefined) out[key] = draftIdList(body[key]);
+  }
+  // single-value legacy fields from older forms
+  if (body.examId && body.examIds === undefined) out.examIds = draftIdList(body.examId);
+  if (body.subjectId && body.subjectIds === undefined) out.subjectIds = draftIdList(body.subjectId);
+  if (body.topicId && body.topicIds === undefined) out.topicIds = draftIdList(body.topicId);
+  if (body.sourceSetId && body.setIds === undefined) out.setIds = draftIdList(body.sourceSetId);
+
+  if (body.difficulty !== undefined) out.difficulty = body.difficulty === '' || body.difficulty === null ? 1 : Number(body.difficulty) || 1;
+  if (body.sourceYear !== undefined) out.sourceYear = body.sourceYear === '' || body.sourceYear === null ? null : Number(body.sourceYear) || null;
+  if (body.isActive !== undefined) out.isActive = parseBoolean(body.isActive, true);
+  if (body.options !== undefined) {
+    const o = body.options && typeof body.options === 'object' && !Array.isArray(body.options) ? body.options : {};
+    out.options = {};
+    for (const k of ['A', 'B', 'C', 'D', 'E']) {
+      const v = o[k] === undefined || o[k] === null ? '' : String(o[k]);
+      if (v.trim() || k !== 'E') out.options[k] = v;
+    }
+  }
+  if (out.correctOption) out.correctOption = String(out.correctOption).trim().toUpperCase();
+  if (out.imageUrl !== undefined) out.hasImage = Boolean(String(out.imageUrl || '').trim());
+  if (!out.questionType) out.questionType = 'MCQ';
+  if (out.isActive === undefined) out.isActive = true;
+  if (out.difficulty === undefined) out.difficulty = 1;
+  for (const key of DRAFT_ID_KEYS) if (!Array.isArray(out[key])) out[key] = [];
+  if (out.questionId !== undefined && !String(out.questionId || '').trim()) delete out.questionId;
+  return out;
+}
+
+// What still has to be fixed before a draft can be uploaded.
+function draftIssues(p = {}) {
+  const issues = [];
+  const stem = String(p.stem || '').trim();
+  if (!stem || /^Imported question \d+/i.test(stem)) issues.push('Question text missing');
+  if (String(p.questionType || 'MCQ').toUpperCase() === 'MCQ') {
+    const o = p.options || {};
+    const filled = ['A', 'B', 'C', 'D', 'E'].filter((k) => String(o[k] || '').trim());
+    if (!['A', 'B', 'C', 'D'].every((k) => filled.includes(k))) issues.push('Options A-D incomplete');
+    const c = String(p.correctOption || '').trim().toUpperCase();
+    if (!c || !filled.includes(c)) issues.push('Correct answer not set');
+  }
+  return issues;
+}
+
+function draftRow(payload, extra = {}) {
+  const issues = draftIssues(payload);
+  return {
+    ...extra,
+    payload,
+    stem: String(payload.stem || '').slice(0, 2000),
+    ready: issues.length === 0,
+    issues,
+    updated_at: now(),
+  };
+}
+
+function mapDraft(row, names = {}) {
+  const p = row.payload || {};
+  const pick = (ids, map) => (ids || []).map((id) => map?.[id]).filter(Boolean);
+  return {
+    id: row.id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    source: row.source,
+    sourceFile: row.source_file,
+    createdByEmail: row.created_by_email,
+    ready: row.ready === true,
+    issues: Array.isArray(row.issues) ? row.issues : [],
+    stem: p.stem || '',
+    questionType: p.questionType || 'MCQ',
+    options: p.options || {},
+    correctOption: p.correctOption || null,
+    explanation: p.explanation || null,
+    difficulty: p.difficulty ?? 1,
+    sourceYear: p.sourceYear ?? null,
+    examIds: p.examIds || [],
+    subjectIds: p.subjectIds || [],
+    topicIds: p.topicIds || [],
+    setIds: p.setIds || [],
+    examNames: pick(p.examIds, names.exams),
+    subjectNames: pick(p.subjectIds, names.subjects),
+    topicNames: pick(p.topicIds, names.topics),
+    setNames: pick(p.setIds, names.sets),
+    payload: p,
+  };
+}
+
+async function draftNames(rows) {
+  const ids = { exams: new Set(), subjects: new Set(), topics: new Set(), sets: new Set() };
+  for (const r of rows) {
+    const p = r.payload || {};
+    (p.examIds || []).forEach((x) => ids.exams.add(String(x)));
+    (p.subjectIds || []).forEach((x) => ids.subjects.add(String(x)));
+    (p.topicIds || []).forEach((x) => ids.topics.add(String(x)));
+    (p.setIds || []).forEach((x) => ids.sets.add(String(x)));
+  }
+  const load = async (table, set) => {
+    if (!set.size) return {};
+    const { data } = await supabaseAdmin.from(table).select('id,name').in('id', [...set]);
+    return Object.fromEntries((data || []).map((r) => [String(r.id), r.name]));
+  };
+  const [exams, subjects, topics, sets] = await Promise.all([
+    load('exams', ids.exams),
+    load('subjects', ids.subjects),
+    load('taxonomy_nodes', ids.topics),
+    load('sets', ids.sets),
+  ]);
+  return { exams, subjects, topics, sets };
+}
+
+function draftTableMissing(e) {
+  return /draft_questions/.test(String(e?.message || '')) && /(exist|schema cache|find)/i.test(String(e?.message || ''));
+}
+
+function draftFail(res, e, code) {
+  if (draftTableMissing(e)) {
+    return error(res, 500, 'Draft questions table is missing. Run sql/2026-11-draft-questions.sql in Supabase.', 'draft_table_missing');
+  }
+  return adminFail(res, e, code);
+}
+
+// The body sent to the normal create code when a draft is uploaded.
+function draftToCreateBody(payload = {}) {
+  const body = { ...payload };
+  if (body.options && typeof body.options === 'object') {
+    const o = {};
+    for (const [k, v] of Object.entries(body.options)) if (String(v || '').trim()) o[k] = String(v).trim();
+    body.options = o;
+  }
+  if (body.correctOption) body.correctOption = String(body.correctOption).trim().toUpperCase();
+  body.stem = String(body.stem || '').trim();
+  return body;
+}
+
+// Uploads drafts one batch at a time. Returns { published, failed, questionIds }.
+async function publishDrafts(ids) {
+  const failed = [];
+  const questionIds = [];
+  const publishedDraftIds = [];
+  const { data: rows, error: loadError } = await supabaseAdmin
+    .from('draft_questions')
+    .select('*')
+    .in('id', ids)
+    .order('created_at', { ascending: true });
+  if (loadError) throw loadError;
+
+  // 1) check each draft on its own so one bad draft does not stop the rest
+  const ok = [];
+  for (const row of rows || []) {
+    const body = draftToCreateBody(row.payload);
+    const issues = draftIssues(row.payload);
+    if (issues.length) {
+      failed.push({ id: row.id, stem: String(body.stem || '').slice(0, 120), error: issues.join(', ') });
+      continue;
+    }
+    try {
+      questionPayload(body);
+      await validateQuestionMappingRelations(
+        pickIds(body, 'examIds', 'examId'),
+        pickIds(body, 'subjectIds', 'subjectId'),
+        pickIds(body, 'topicIds', 'topicId')
+      );
+      ok.push({ row, body });
+    } catch (e) {
+      failed.push({ id: row.id, stem: String(body.stem || '').slice(0, 120), error: e?.message || 'Invalid question.' });
+    }
+  }
+
+  // 2) fast path: one bulk insert for all valid drafts
+  if (ok.length) {
+    try {
+      const result = await bulkCreateQuestions(ok.map((x) => x.body));
+      for (const q of result.questions || []) if (q?.id) questionIds.push(String(q.id));
+      publishedDraftIds.push(...ok.map((x) => x.row.id));
+    } catch (_) {
+      // 3) slow path: find which ones fail (e.g. a duplicate Question ID)
+      for (const { row, body } of ok) {
+        try {
+          const q = await createQuestionFromBody(body);
+          if (q?.id) questionIds.push(String(q.id));
+          publishedDraftIds.push(row.id);
+        } catch (e) {
+          failed.push({ id: row.id, stem: String(body.stem || '').slice(0, 120), error: e?.message || 'Upload failed.' });
+        }
+      }
+    }
+  }
+
+  if (publishedDraftIds.length) {
+    const { error: delError } = await supabaseAdmin.from('draft_questions').delete().in('id', publishedDraftIds);
+    if (delError) throw delError;
+  }
+  return { published: publishedDraftIds.length, publishedIds: publishedDraftIds, failed, questionIds };
+}
+
+app.get('/api/admin/draft-questions', adminAuth, async (req, res) => {
+  try {
+    const page = Math.max(1, Math.floor(number(req.query.page, 1)));
+    const pageSize = Math.min(200, Math.max(1, Math.floor(number(req.query.pageSize, 25))));
+    const search = String(req.query.search || '').trim();
+    const source = String(req.query.source || '').trim();
+    const status = String(req.query.status || '').trim();
+
+    let query = supabaseAdmin.from('draft_questions').select('*', { count: 'exact' });
+    if (search) query = query.ilike('stem', `%${search.replace(/[%_]/g, (m) => `\\${m}`)}%`);
+    if (source) query = query.eq('source', source);
+    if (status === 'ready') query = query.eq('ready', true);
+    if (status === 'review') query = query.eq('ready', false);
+    query = query.order('created_at', { ascending: false }).range((page - 1) * pageSize, page * pageSize - 1);
+
+    const { data, count, error: dbError } = await query;
+    if (dbError) throw dbError;
+
+    const [{ count: total }, { count: readyCount }] = await Promise.all([
+      supabaseAdmin.from('draft_questions').select('id', { count: 'exact', head: true }),
+      supabaseAdmin.from('draft_questions').select('id', { count: 'exact', head: true }).eq('ready', true),
+    ]);
+
+    const names = await draftNames(data || []);
+    return response(res, {
+      drafts: (data || []).map((r) => mapDraft(r, names)),
+      total: count ?? 0,
+      page,
+      pageSize,
+      summary: { all: total ?? 0, ready: readyCount ?? 0, review: Math.max(0, (total ?? 0) - (readyCount ?? 0)) },
+    });
+  } catch (e) {
+    return draftFail(res, e, 'admin_drafts_list_error');
+  }
+});
+
+// Every draft id (oldest first) so the admin can upload/delete in batches.
+app.get('/api/admin/draft-questions/ids', adminAuth, async (req, res) => {
+  try {
+    let query = supabaseAdmin.from('draft_questions').select('id').order('created_at', { ascending: true }).limit(10000);
+    if (String(req.query.status || '') === 'ready') query = query.eq('ready', true);
+    const { data, error: dbError } = await query;
+    if (dbError) throw dbError;
+    return response(res, { ids: (data || []).map((r) => r.id) });
+  } catch (e) {
+    return draftFail(res, e, 'admin_drafts_ids_error');
+  }
+});
+
+app.get('/api/admin/draft-questions/:id', adminAuth, async (req, res) => {
+  try {
+    const { data, error: dbError } = await supabaseAdmin.from('draft_questions').select('*').eq('id', req.params.id).maybeSingle();
+    if (dbError) throw dbError;
+    if (!data) return error(res, 404, 'Draft not found. It may already be uploaded or deleted.', 'draft_not_found');
+    const names = await draftNames([data]);
+    return response(res, { draft: mapDraft(data, names) });
+  } catch (e) {
+    return draftFail(res, e, 'admin_draft_get_error');
+  }
+});
+
+// One question, or { questions: [...], sourceFile } from bulk import.
+app.post('/api/admin/draft-questions', adminAuth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const many = Array.isArray(body) ? body : Array.isArray(body.questions) ? body.questions : null;
+    const list = many || [body];
+    if (!list.length) return error(res, 400, 'No questions supplied.', 'questions_required');
+    if (list.length > 1000) return error(res, 400, 'Maximum 1000 questions per request.', 'draft_limit');
+
+    const source = many ? 'bulk' : String(body.source || 'manual') === 'bulk' ? 'bulk' : 'manual';
+    const sourceFile = optionalText(Array.isArray(body) ? null : body.sourceFile);
+    const rows = list.map((item) =>
+      draftRow(draftPayload(item || {}), {
+        source,
+        source_file: sourceFile,
+        created_by: req.user?.id || null,
+        created_by_email: req.user?.email || null,
+      })
+    );
+    if (!many && !String(rows[0].payload.stem || '').trim()) {
+      return error(res, 400, 'Question text is required.', 'stem_required');
+    }
+
+    const { data, error: dbError } = await supabaseAdmin.from('draft_questions').insert(rows).select('*');
+    if (dbError) throw dbError;
+
+    res.locals.audit = {
+      action: 'create',
+      entityId: many ? null : data?.[0]?.id,
+      summary: many
+        ? `Saved ${data.length} draft question${data.length === 1 ? '' : 's'} from bulk import${sourceFile ? ` (${sourceFile})` : ''}`
+        : `Saved draft question "${String(rows[0].stem).slice(0, 80)}"`,
+    };
+    if (many) return response(res, { count: data.length, ids: data.map((r) => r.id) }, 201);
+    return response(res, { draft: mapDraft(data[0]) }, 201);
+  } catch (e) {
+    return draftFail(res, e, 'admin_draft_create_error');
+  }
+});
+
+// Bulk changes, e.g. assign exam/set/subject/topic, difficulty or year to many drafts.
+app.patch('/api/admin/draft-questions', adminAuth, async (req, res) => {
+  try {
+    const ids = draftIdList(req.body?.ids);
+    const patch = req.body?.patch || {};
+    if (!ids.length) return error(res, 400, 'Select at least one draft.', 'ids_required');
+    if (ids.length > 2000) return error(res, 400, 'Maximum 2000 drafts per request.', 'draft_limit');
+    const allowed = {};
+    for (const k of [...DRAFT_ID_KEYS, 'difficulty', 'sourceYear', 'questionType', 'isActive']) {
+      if (patch[k] !== undefined) allowed[k] = patch[k];
+    }
+    if (!Object.keys(allowed).length) return error(res, 400, 'Nothing to change.', 'empty_update');
+
+    const { data: rows, error: loadError } = await supabaseAdmin.from('draft_questions').select('id,payload').in('id', ids);
+    if (loadError) throw loadError;
+    const updates = (rows || []).map((r) => ({ id: r.id, ...draftRow(draftPayload(allowed, draftPayload(r.payload || {}))) }));
+    if (updates.length) {
+      const { error: upError } = await supabaseAdmin.from('draft_questions').upsert(updates, { onConflict: 'id' });
+      if (upError) throw upError;
+    }
+    res.locals.audit = { action: 'update', summary: `Updated ${updates.length} draft question(s) - ${Object.keys(allowed).join(', ')}` };
+    return response(res, { updated: updates.length });
+  } catch (e) {
+    return draftFail(res, e, 'admin_drafts_bulk_update_error');
+  }
+});
+
+app.patch('/api/admin/draft-questions/:id', adminAuth, async (req, res) => {
+  try {
+    const { data: current, error: loadError } = await supabaseAdmin.from('draft_questions').select('*').eq('id', req.params.id).maybeSingle();
+    if (loadError) throw loadError;
+    if (!current) return error(res, 404, 'Draft not found. It may already be uploaded or deleted.', 'draft_not_found');
+    const payload = draftPayload(req.body || {}, draftPayload(current.payload || {}));
+    const { data, error: dbError } = await supabaseAdmin
+      .from('draft_questions')
+      .update(draftRow(payload))
+      .eq('id', req.params.id)
+      .select('*')
+      .maybeSingle();
+    if (dbError) throw dbError;
+    const names = await draftNames([data]);
+    return response(res, { draft: mapDraft(data, names) });
+  } catch (e) {
+    return draftFail(res, e, 'admin_draft_update_error');
+  }
+});
+
+app.delete('/api/admin/draft-questions/:id', adminAuth, async (req, res) => {
+  try {
+    const { data, error: dbError } = await supabaseAdmin.from('draft_questions').delete().eq('id', req.params.id).select('id');
+    if (dbError) throw dbError;
+    if (!data?.length) return error(res, 404, 'Draft not found.', 'draft_not_found');
+    return response(res, { deleted: 1 });
+  } catch (e) {
+    return draftFail(res, e, 'admin_draft_delete_error');
+  }
+});
+
+// { ids: [...] } or { all: true }
+app.post('/api/admin/draft-questions/delete', adminAuth, async (req, res) => {
+  try {
+    const all = req.body?.all === true;
+    const ids = draftIdList(req.body?.ids);
+    if (!all && !ids.length) return error(res, 400, 'Select at least one draft.', 'ids_required');
+    let query = supabaseAdmin.from('draft_questions').delete();
+    query = all ? query.not('id', 'is', null) : query.in('id', ids);
+    const { data, error: dbError } = await query.select('id');
+    if (dbError) throw dbError;
+    res.locals.audit = { action: 'delete', summary: `Deleted ${data?.length || 0} draft question(s)${all ? ' (all drafts)' : ''}` };
+    return response(res, { deleted: data?.length || 0 });
+  } catch (e) {
+    return draftFail(res, e, 'admin_drafts_delete_error');
+  }
+});
+
+// Upload (publish) a batch: { ids: [...] } up to 100 per call.
+app.post('/api/admin/draft-questions/publish', adminAuth, async (req, res) => {
+  try {
+    const ids = draftIdList(req.body?.ids);
+    if (!ids.length) return error(res, 400, 'Select at least one draft.', 'ids_required');
+    if (ids.length > 100) return error(res, 400, 'Upload at most 100 drafts per request.', 'draft_limit');
+    const result = await publishDrafts(ids);
+    res.locals.audit = {
+      action: 'create',
+      summary: `Uploaded ${result.published} draft question(s) to the question bank${result.failed.length ? `, ${result.failed.length} need fixing` : ''}`,
+    };
+    return response(res, result);
+  } catch (e) {
+    return draftFail(res, e, 'admin_drafts_publish_error');
+  }
+});
+
+app.post('/api/admin/draft-questions/:id/publish', adminAuth, async (req, res) => {
+  try {
+    const result = await publishDrafts([req.params.id]);
+    if (!result.published) {
+      const reason = result.failed[0]?.error || 'Draft not found. It may already be uploaded or deleted.';
+      return error(res, 400, reason, 'draft_publish_failed');
+    }
+    res.locals.audit = { action: 'create', entityId: result.questionIds[0] || null, summary: 'Uploaded a draft question to the question bank' };
+    return response(res, { published: 1, questionId: result.questionIds[0] || null });
+  } catch (e) {
+    return draftFail(res, e, 'admin_draft_publish_error');
+  }
+});
+
+// =========================================================
+// ADMIN - SITE CONTROLS (stored as rows in app_config)
+// =========================================================
+// The user app already receives every app_config row from GET /api/app-config.
+// Maintenance mode is also enforced here on the server (see maintenanceGate).
+
+const SITE_CONTROL_DEFAULTS = {
+  feature_flags: {
+    maintenance_mode: false,
+    market_enabled: true,
+    mock_enabled: true,
+    review_enabled: true,
+  },
+  maintenance: {
+    message: 'PYQ Pulse is under maintenance. Please try again in a little while.',
+  },
+  app_update: {
+    latest_version: '',
+    min_version: '',
+    force_update: false,
+    update_url: '',
+    message: '',
+  },
+  announcement: {
+    enabled: false,
+    text: '',
+    type: 'info',
+  },
+  support: {
+    email: '',
+    phone: '',
+    whatsapp: '',
+  },
+  default_limits: {
+    practiceQuestions: 10,
+    quizQuestions: 10,
+    testQuestions: 30,
+  },
+};
+const SITE_CONTROL_KEYS = Object.keys(SITE_CONTROL_DEFAULTS);
+
+async function readSiteControlRows() {
+  try {
+    const { data } = await supabaseAdmin
+      .from('app_config')
+      .select('key,value')
+      .in('key', SITE_CONTROL_KEYS);
+    const out = {};
+    for (const row of data || []) out[row.key] = row.value;
+    return out;
+  } catch (_) {
+    return null;
+  }
+}
+
+function plainObject(value) {
+  if (value && typeof value === 'string') {
+    try { value = JSON.parse(value); } catch (_) { return {}; }
+  }
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+async function siteControls() {
+  const stored = (await readSiteControlRows()) || {};
+  const out = {};
+  for (const key of SITE_CONTROL_KEYS) {
+    out[key] = { ...SITE_CONTROL_DEFAULTS[key], ...plainObject(stored[key]) };
+  }
+  return out;
+}
+
+function cleanSiteControl(key, input) {
+  const base = SITE_CONTROL_DEFAULTS[key];
+  const value = plainObject(input);
+  const out = {};
+  for (const [field, def] of Object.entries(base)) {
+    const v = value[field];
+    if (typeof def === 'boolean') out[field] = v === undefined ? def : parseBoolean(v);
+    else if (typeof def === 'number') {
+      const n = Math.floor(number(v, def));
+      out[field] = Math.max(1, Math.min(500, Number.isFinite(n) ? n : def));
+    } else out[field] = v === undefined || v === null ? def : String(v).trim().slice(0, 1000);
+  }
+  if (key === 'announcement' && !['info', 'warning', 'success'].includes(out.type)) out.type = 'info';
+  // keep any extra flags that were added earlier (e.g. by another tool)
+  if (key === 'feature_flags') {
+    for (const [field, v] of Object.entries(value)) {
+      if (!(field in out) && typeof v === 'boolean') out[field] = v;
+    }
+  }
+  return out;
+}
+
+let maintenanceCache = { at: 0, on: false, message: '' };
+async function maintenanceState() {
+  if (Date.now() - maintenanceCache.at < 15000) return maintenanceCache;
+  const controls = await siteControls();
+  maintenanceCache = {
+    at: Date.now(),
+    on: Boolean(controls.feature_flags.maintenance_mode),
+    message: controls.maintenance.message || SITE_CONTROL_DEFAULTS.maintenance.message,
+  };
+  return maintenanceCache;
+}
+
+app.get('/api/admin/site-controls', adminAuth, async (req, res) => {
+  try {
+    const controls = await siteControls();
+    const { data } = await supabaseAdmin
+      .from('app_config')
+      .select('key,updated_at')
+      .in('key', SITE_CONTROL_KEYS);
+    const updated = (data || [])
+      .map((r) => r.updated_at)
+      .filter(Boolean)
+      .sort()
+      .pop() || null;
+    return response(res, { controls, updatedAt: updated });
+  } catch (e) {
+    return adminFail(res, e, 'admin_site_controls_error', 500);
+  }
+});
+
+app.put('/api/admin/site-controls', adminAuth, async (req, res) => {
+  try {
+    const body = req.body?.controls || req.body || {};
+    const rows = [];
+    for (const key of SITE_CONTROL_KEYS) {
+      if (body[key] === undefined) continue;
+      rows.push({ key, value: cleanSiteControl(key, body[key]), updated_at: now() });
+    }
+    if (!rows.length) return error(res, 400, 'No site controls supplied.', 'empty_update');
+
+    const { error: dbError } = await supabaseAdmin
+      .from('app_config')
+      .upsert(rows, { onConflict: 'key' });
+    if (dbError) throw dbError;
+
+    maintenanceCache = { at: 0, on: false, message: '' };
+    return response(res, { controls: await siteControls(), updatedAt: now() });
+  } catch (e) {
+    return adminFail(res, e, 'admin_site_controls_update_error');
+  }
+});
+
+// =========================================================
 // ADMIN - BANNERS
 // =========================================================
 
@@ -5340,6 +6241,7 @@ app.get('/api/admin/market-products', adminAuth, async (req, res) => {
     const { data, error: dbError } = await supabaseAdmin
       .from('market_products')
       .select('*')
+      .order('display_order', { ascending: true })
       .order('created_at', { ascending: false });
 
     if (dbError) throw dbError;
@@ -5374,6 +6276,7 @@ app.post('/api/admin/market-products', adminAuth, async (req, res) => {
         is_active: parseBoolean(bodyValue(body, 'isActive', 'is_active', true)),
         featured: parseBoolean(bodyValue(body, 'featured', 'featured', false)),
         image_url: optionalText(bodyValue(body, 'imageUrl', 'image_url')),
+        ...productExtraPayload(body, false),
       })
       .select('*')
       .single();
@@ -5411,6 +6314,7 @@ app.patch('/api/admin/market-products/:id', adminAuth, async (req, res) => {
     if (body.imageUrl !== undefined || body.image_url !== undefined) {
       update.image_url = optionalText(bodyValue(body, 'imageUrl', 'image_url'));
     }
+    Object.assign(update, productExtraPayload(body, true));
 
     ensureNonEmptyUpdate(update);
     update.updated_at = now();
@@ -5736,6 +6640,128 @@ app.delete('/api/admin/mode-rules/:id', adminAuth, async (req, res) => {
     return response(res, { deleted: true, id: req.params.id });
   } catch (e) {
     return adminFail(res, e, 'admin_mode_rule_delete_error');
+  }
+});
+
+// =========================================================
+// ADMIN - AUDIT LOGS (READ ONLY)
+// =========================================================
+
+function mapAuditLog(row) {
+  return {
+    id: row.id,
+    createdAt: row.created_at,
+    adminId: row.admin_id || null,
+    adminEmail: row.admin_email || null,
+    action: row.action,
+    method: row.method,
+    entityType: row.entity_type || null,
+    entityId: row.entity_id || null,
+    summary: row.summary || '',
+    path: row.path || null,
+    statusCode: row.status_code ?? null,
+    success: Boolean(row.success),
+    errorMessage: row.error_message || null,
+    details: row.details || null,
+    ip: row.ip || null,
+    userAgent: row.user_agent || null,
+    durationMs: row.duration_ms ?? null,
+  };
+}
+
+// GET /api/admin/audit-logs?page=1&pageSize=25&search=&action=&entity=&admin=&status=success|failed&from=&to=
+app.get('/api/admin/audit-logs', adminAuth, async (req, res) => {
+  try {
+    const page = Math.max(1, Math.floor(number(req.query.page, 1)));
+    const pageSize = Math.min(100, Math.max(1, Math.floor(number(req.query.pageSize, 25))));
+
+    let query = supabaseAdmin.from('audit_logs').select('*', { count: 'exact' });
+
+    const search = String(req.query.search || '').trim().replace(/[,()%]/g, ' ');
+    if (search) {
+      query = query.or(
+        `summary.ilike.%${search}%,admin_email.ilike.%${search}%,entity_id.ilike.%${search}%,entity_type.ilike.%${search}%`
+      );
+    }
+    const action = String(req.query.action || '').trim();
+    if (action) query = query.eq('action', action);
+    const entity = String(req.query.entity || '').trim();
+    if (entity) query = query.eq('entity_type', entity);
+    const adminEmail = String(req.query.admin || '').trim();
+    if (adminEmail) query = query.eq('admin_email', adminEmail);
+    const status = String(req.query.status || '').trim();
+    if (status === 'success') query = query.eq('success', true);
+    if (status === 'failed') query = query.eq('success', false);
+    const from = String(req.query.from || '').trim();
+    if (from) query = query.gte('created_at', new Date(from).toISOString());
+    const to = String(req.query.to || '').trim();
+    if (to) {
+      const end = new Date(to);
+      end.setDate(end.getDate() + 1); // the whole "to" day
+      query = query.lt('created_at', end.toISOString());
+    }
+
+    const { data, error: dbError, count } = await query
+      .order('created_at', { ascending: false })
+      .range((page - 1) * pageSize, page * pageSize - 1);
+    if (dbError) throw dbError;
+
+    // values for the filter drop-downs
+    const { data: recent } = await supabaseAdmin
+      .from('audit_logs')
+      .select('entity_type,admin_email')
+      .order('created_at', { ascending: false })
+      .limit(1000);
+
+    return response(res, {
+      logs: (data || []).map(mapAuditLog),
+      writeError: auditLastWriteError,
+      total: count ?? 0,
+      page,
+      pageSize,
+      filters: {
+        entities: [...new Set((recent || []).map((r) => r.entity_type).filter(Boolean))].sort(),
+        admins: [...new Set((recent || []).map((r) => r.admin_email).filter(Boolean))].sort(),
+      },
+    });
+  } catch (e) {
+    if (/audit_logs/i.test(String(e?.message || '')) || e?.code === '42P01' || e?.code === 'PGRST205') {
+      return error(res, 500, 'Audit log table is missing. Run audit_logs SQL (sql/2026-11-audit-logs.sql) in Supabase, then reload.', 'audit_table_missing');
+    }
+    return adminFail(res, e, 'admin_audit_logs_error', 500);
+  }
+});
+
+// Writes and removes a test row, so the admin can see whether logging works.
+app.get('/api/admin/audit-logs/check', adminAuth, async (req, res) => {
+  const row = {
+    admin_id: req.user?.id || null,
+    admin_email: req.user?.email || null,
+    action: 'test',
+    method: 'GET',
+    entity_type: 'audit check',
+    entity_id: null,
+    summary: 'Audit log self-check',
+    path: '/api/admin/audit-logs/check',
+    status_code: 200,
+    success: true,
+  };
+  const { data, error: insertError } = await supabaseAdmin.from('audit_logs').insert(row).select('id').maybeSingle();
+  if (insertError) {
+    auditLastWriteError = { message: insertError.message, code: insertError.code || null, hint: insertError.hint || null, at: now() };
+    return response(res, { ok: false, error: auditLastWriteError });
+  }
+  if (data?.id) await supabaseAdmin.from('audit_logs').delete().eq('id', data.id);
+  auditLastWriteError = null;
+  return response(res, { ok: true });
+});
+
+app.get('/api/admin/audit-logs/:id', adminAuth, async (req, res) => {
+  try {
+    const row = await assertExists('audit_logs', 'id', req.params.id, 'Audit log');
+    return response(res, { log: mapAuditLog(row) });
+  } catch (e) {
+    return adminFail(res, e, 'admin_audit_log_error', 500);
   }
 });
 
@@ -6166,55 +7192,36 @@ app.get(
           .from('market_products')
           .select('*')
           .eq('is_active', true)
-          .order('featured', {
-            ascending: false,
-          });
+          .order('featured', { ascending: false })
+          .order('display_order', { ascending: true })
+          .order('created_at', { ascending: false });
 
       if (dbError) throw dbError;
 
-      const products = (data || []).map(
-        (row) => ({
-          id: row.id,
-          title: row.title,
-          description: row.description,
+      let products = (data || []).map(mapProduct);
 
-          category: row.category,
-          type: row.type,
+      // optional server side search / filter / sort (the app can also do this on the phone)
+      const search = String(req.query.search || req.query.q || '').trim().toLowerCase();
+      const category = String(req.query.category || '').trim().toLowerCase();
+      if (search) {
+        products = products.filter((p) =>
+          [p.title, p.description, p.category, p.subjectLabel, p.badge]
+            .some((v) => String(v || '').toLowerCase().includes(search))
+        );
+      }
+      if (category) products = products.filter((p) => String(p.category || '').toLowerCase() === category);
+      if (String(req.query.featured || '') === 'true') products = products.filter((p) => p.isFeatured);
+      if (String(req.query.hasOffer || '') === 'true') products = products.filter((p) => p.hasOffer);
 
-          price:
-            row.price !== null
-              ? String(row.price)
-              : null,
+      const pay = (p) => Number(p.salePrice ?? p.price ?? 0);
+      const sort = String(req.query.sort || 'featured');
+      if (sort === 'priceLow') products.sort((a, b) => pay(a) - pay(b));
+      else if (sort === 'priceHigh') products.sort((a, b) => pay(b) - pay(a));
+      else if (sort === 'discount') products.sort((a, b) => Number(b.discountPercent || 0) - Number(a.discountPercent || 0));
+      else if (sort === 'name') products.sort((a, b) => String(a.title || '').localeCompare(String(b.title || '')));
+      else if (sort === 'rating') products.sort((a, b) => Number(b.rating || 0) - Number(a.rating || 0));
 
-          salePrice:
-            row.sale_price !== null
-              ? String(row.sale_price)
-              : null,
-
-          mrp:
-            row.mrp !== null
-              ? String(row.mrp)
-              : null,
-
-          currency: row.currency,
-          stock: row.stock,
-
-          isActive: row.is_active,
-          featured: row.featured,
-          isFeatured: Boolean(row.featured),
-          inStock: row.stock === null || Number(row.stock || 0) > 0,
-          requiresShipping: String(row.type || '').toUpperCase() !== 'DIGITAL',
-          hasOffer: row.sale_price !== null && row.price !== null && Number(row.sale_price) < Number(row.price),
-          discountPercent: row.sale_price !== null && row.mrp !== null && Number(row.mrp) > 0 ? Math.max(0, Math.round((1 - Number(row.sale_price) / Number(row.mrp)) * 100)) : null,
-          offerLabel: row.sale_price !== null && row.mrp !== null && Number(row.mrp) > 0 ? `${Math.max(0, Math.round((1 - Number(row.sale_price) / Number(row.mrp)) * 100))}% OFF` : null,
-          imageUrl: row.image_url || null,
-          imageUrls: row.image_url ? [row.image_url] : [],
-        })
-      );
-
-      return response(res, {
-        products,
-      });
+      return response(res, { products });
     } catch (e) {
       return error(
         res,
@@ -6222,6 +7229,25 @@ app.get(
         e.message,
         'products_error'
       );
+    }
+  }
+);
+
+app.get(
+  '/api/market-products/:id',
+  async (req, res) => {
+    try {
+      const { data, error: dbError } = await supabaseAdmin
+        .from('market_products')
+        .select('*')
+        .eq('id', req.params.id)
+        .eq('is_active', true)
+        .maybeSingle();
+      if (dbError) throw dbError;
+      if (!data) return error(res, 404, 'Product not found.', 'product_not_found');
+      return response(res, { product: mapProduct(data) });
+    } catch (e) {
+      return error(res, 500, e.message, 'product_error');
     }
   }
 );
