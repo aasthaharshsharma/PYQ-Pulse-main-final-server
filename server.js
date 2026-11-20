@@ -6724,12 +6724,35 @@ app.get('/api/admin/audit-logs', adminAuth, async (req, res) => {
         admins: [...new Set((recent || []).map((r) => r.admin_email).filter(Boolean))].sort(),
       },
     });
-  } catch (e) {
-    if (/audit_logs/i.test(String(e?.message || '')) || e?.code === '42P01' || e?.code === 'PGRST205') {
-      return error(res, 500, 'Audit log table is missing. Run audit_logs SQL (sql/2026-11-audit-logs.sql) in Supabase, then reload.', 'audit_table_missing');
-    }
-    return adminFail(res, e, 'admin_audit_logs_error', 500);
+
+} catch (e) {
+  const isAuditTableMissing =
+    e?.code === '42P01' ||
+    e?.code === 'PGRST205' ||
+    (
+      e?.code === 'PGRST204' &&
+      /audit_logs/i.test(String(e?.message || ''))
+    );
+
+  if (isAuditTableMissing) {
+    return error(
+      res,
+      500,
+      'Audit log table is missing or unavailable in the API schema cache.',
+      'audit_table_missing'
+    );
   }
+
+  console.error('[AUDIT LOGS GET ERROR]', {
+    message: e?.message,
+    code: e?.code,
+    details: e?.details,
+    hint: e?.hint,
+  });
+
+  return adminFail(res, e, 'admin_audit_logs_error', 500);
+}
+
 });
 
 // Writes and removes a test row, so the admin can see whether logging works.
