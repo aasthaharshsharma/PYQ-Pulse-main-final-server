@@ -9584,10 +9584,12 @@ app.get('/api/admin/notifications', adminAuth, async (req, res) => {
 });
 
 app.get('/api/admin/notifications/stats', adminAuth, async (req, res) => {
+  // Not head:true. A HEAD request returns no error body, so the real Supabase message would be hidden.
   const { count: deviceCount, error: dbError } = await supabaseAdmin
     .from('device_tokens')
-    .select('id', { count: 'exact', head: true })
-    .eq('active', true);
+    .select('id', { count: 'exact' })
+    .eq('active', true)
+    .limit(1);
 
   if (dbError) return adminFail(res, dbError, 'notifications_stats_failed', 500);
 
