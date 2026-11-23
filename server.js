@@ -58,6 +58,8 @@ function validatePrivilegedSupabaseKey(key) {
 
 validatePrivilegedSupabaseKey(SUPABASE_ADMIN_KEY);
 
+const SUPABASE_KEY_PREFIX = (process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ADMIN_KEY || '').slice(0, 10);
+console.log('[boot] Supabase key prefix:', SUPABASE_KEY_PREFIX ? SUPABASE_KEY_PREFIX + '...' : '(missing)', '| url host:', (process.env.SUPABASE_URL || '').replace(/^https?:\/\//, '').split('/')[0]);
 const supabaseAdmin = createClient(
   SUPABASE_URL,
   SUPABASE_ADMIN_KEY,
@@ -2441,38 +2443,50 @@ function requireUpdatedRow(data, label = 'Record') {
   return data;
 }
 
+// Shows the REAL database error (Supabase/Postgres message, code, details, hint) instead of a generic text.
 function adminDbError(e, fallbackCode) {
-  const rawMessage = String(e?.message || 'Database operation failed.');
+  const message =
+    String(e?.message || "").trim() ||
+    String(e?.details || "").trim() ||
+    String(e?.hint || "").trim() ||
+    (e?.code ? "Database error " + e.code : "") ||
+    "Database operation failed (no message from Supabase).";
 
   const isRls =
-    e?.code === '42501' ||
-    /row-level security policy/i.test(rawMessage) ||
-    /violates row-level security/i.test(rawMessage);
+    e?.code === "42501" ||
+    /row-level security policy/i.test(message) ||
+    /violates row-level security/i.test(message);
 
   const code = isRls
-    ? 'admin_db_key_not_privileged'
-    : (e?.code || e?.details || fallbackCode);
+    ? "admin_db_key_not_privileged"
+    : (e?.code || fallbackCode);
 
   const status =
     e?.status ||
-    (isRls ? 503 : e?.code === '23505' ? 409 : e?.code === '23503' ? 400 : 500);
+    (isRls ? 503 : e?.code === "23505" ? 409 : e?.code === "23503" ? 400 : 500);
 
   return {
     status,
-    message: rawMessage,
+    message: e?.code && !message.includes(e.code) ? message + " (code " + e.code + ")" : message,
     code,
+    details: e?.details || null,
+    hint: e?.hint || null,
+    dbCode: e?.code || null,
   };
 }
 
-
 function adminFail(res, e, fallbackCode, fallbackStatus = 400) {
   const info = adminDbError(e, fallbackCode);
-  return error(
-    res,
-    info.status || fallbackStatus,
-    info.message,
-    info.code || fallbackCode
-  );
+  // Full error in the server log, so Render logs show the exact cause too.
+  console.error("[admin db error]", fallbackCode, JSON.stringify({ message: e?.message, code: e?.code, details: e?.details, hint: e?.hint }));
+  return res.status(info.status || fallbackStatus).json({
+    success: false,
+    message: info.message,
+    code: info.code || fallbackCode,
+    ...(info.dbCode ? { dbCode: info.dbCode } : {}),
+    ...(info.details ? { details: info.details } : {}),
+    ...(info.hint ? { hint: info.hint } : {}),
+  });
 }
 
 function ensureNonEmptyUpdate(update) {
