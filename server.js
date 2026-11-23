@@ -5,6 +5,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const crypto = require('crypto');
+const push = require('./push');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
@@ -663,6 +664,7 @@ const AUDIT_ENTITIES = {
   media: ['media upload', null],
   'site-controls': ['site controls', '__site_controls'],
   'draft-questions': ['draft question', 'draft_questions'],
+  notifications: ['notification', 'notifications'],
 };
 
 const AUDIT_SKIP_COLUMNS = new Set(['updated_at', 'created_at']);
@@ -6724,35 +6726,12 @@ app.get('/api/admin/audit-logs', adminAuth, async (req, res) => {
         admins: [...new Set((recent || []).map((r) => r.admin_email).filter(Boolean))].sort(),
       },
     });
-
-} catch (e) {
-  const isAuditTableMissing =
-    e?.code === '42P01' ||
-    e?.code === 'PGRST205' ||
-    (
-      e?.code === 'PGRST204' &&
-      /audit_logs/i.test(String(e?.message || ''))
-    );
-
-  if (isAuditTableMissing) {
-    return error(
-      res,
-      500,
-      'Audit log table is missing or unavailable in the API schema cache.',
-      'audit_table_missing'
-    );
+  } catch (e) {
+    if (/audit_logs/i.test(String(e?.message || '')) || e?.code === '42P01' || e?.code === 'PGRST205') {
+      return error(res, 500, 'Audit log table is missing. Run audit_logs SQL (sql/2026-11-audit-logs.sql) in Supabase, then reload.', 'audit_table_missing');
+    }
+    return adminFail(res, e, 'admin_audit_logs_error', 500);
   }
-
-  console.error('[AUDIT LOGS GET ERROR]', {
-    message: e?.message,
-    code: e?.code,
-    details: e?.details,
-    hint: e?.hint,
-  });
-
-  return adminFail(res, e, 'admin_audit_logs_error', 500);
-}
-
 });
 
 // Writes and removes a test row, so the admin can see whether logging works.
@@ -9469,6 +9448,270 @@ app.get(
 
 /*
 |--------------------------------------------------------------------------
+| Notifications (push via Firebase)
+|--------------------------------------------------------------------------
+| App (signed-in user):
+|   POST /api/notifications/device          register this phone's FCM token
+|   POST /api/notifications/device/remove   forget the token (on logout)
+| Admin:
+|   GET    /api/admin/notifications            history and scheduled list
+|   GET    /api/admin/notifications/stats      device count and Firebase status
+|   POST   /api/admin/notifications            create (send now or schedule)
+|   POST   /api/admin/notifications/:id/send   send now
+|   POST   /api/admin/notifications/:id/cancel cancel a scheduled one
+|   DELETE /api/admin/notifications/:id        delete (not while sending)
+*/
+
+const NOTIFICATION_TARGETS = new Set(['all', 'user', 'topic']);
+const NOTIFICATION_STATUSES = new Set(['scheduled', 'sending', 'sent', 'failed', 'cancelled']);
+
+function mapNotification(row) {
+  return {
+    id: row.id,
+    title: row.title,
+    body: row.body,
+    imageUrl: row.image_url || null,
+    targetType: row.target_type,
+    targetValue: row.target_value || null,
+    route: row.route || null,
+    status: row.status,
+    scheduledAt: row.scheduled_at || null,
+    sentAt: row.sent_at || null,
+    successCount: row.success_count || 0,
+    failureCount: row.failure_count || 0,
+    errorMessage: row.error_message || null,
+    createdByEmail: row.created_by_email || null,
+    createdAt: row.created_at,
+  };
+}
+
+function notificationText(value, field, max) {
+  const text = String(value ?? '').trim();
+  if (!text) {
+    const err = new Error(`${field} is required.`);
+    err.status = 400;
+    err.code = 'notification_invalid';
+    throw err;
+  }
+  if (text.length > max) {
+    const err = new Error(`${field} must be ${max} characters or less.`);
+    err.status = 400;
+    err.code = 'notification_invalid';
+    throw err;
+  }
+  return text;
+}
+
+app.post('/api/notifications/device', auth, async (req, res) => {
+  try {
+    const token = String(req.body?.token || '').trim();
+    if (token.length < 20 || token.length > 4096) {
+      return error(res, 400, 'A valid device token is required.', 'token_invalid');
+    }
+
+    const { error: dbError } = await supabaseAdmin
+      .from('device_tokens')
+      .upsert(
+        {
+          token,
+          user_id: req.user.id,
+          platform: optionalText(req.body?.platform),
+          app_version: optionalText(req.body?.appVersion),
+          active: true,
+          last_seen_at: now(),
+          updated_at: now(),
+        },
+        { onConflict: 'token' }
+      );
+
+    if (dbError) return adminFail(res, dbError, 'device_register_failed', 500);
+    return response(res, { registered: true });
+  } catch (e) {
+    return error(res, 500, e.message, 'device_register_failed');
+  }
+});
+
+app.post('/api/notifications/device/remove', auth, async (req, res) => {
+  const token = String(req.body?.token || '').trim();
+  if (!token) return error(res, 400, 'Token is required.', 'token_invalid');
+
+  const { error: dbError } = await supabaseAdmin
+    .from('device_tokens')
+    .update({ active: false, updated_at: now() })
+    .eq('token', token)
+    .eq('user_id', req.user.id);
+
+  if (dbError) return adminFail(res, dbError, 'device_remove_failed', 500);
+  return response(res, { removed: true });
+});
+
+app.get('/api/admin/notifications', adminAuth, async (req, res) => {
+  const page = Math.max(1, number(req.query.page, 1));
+  const limit = Math.min(100, Math.max(1, number(req.query.limit, 20)));
+  const status = String(req.query.status || '').trim();
+
+  let query = supabaseAdmin
+    .from('notifications')
+    .select('*', { count: 'exact' })
+    .order('created_at', { ascending: false })
+    .range((page - 1) * limit, page * limit - 1);
+
+  if (NOTIFICATION_STATUSES.has(status)) query = query.eq('status', status);
+
+  const { data, error: dbError, count } = await query;
+  if (dbError) return adminFail(res, dbError, 'notifications_list_failed', 500);
+
+  return response(res, {
+    items: (data || []).map(mapNotification),
+    total: count || 0,
+    page,
+    limit,
+  });
+});
+
+app.get('/api/admin/notifications/stats', adminAuth, async (req, res) => {
+  const { count: deviceCount, error: dbError } = await supabaseAdmin
+    .from('device_tokens')
+    .select('id', { count: 'exact', head: true })
+    .eq('active', true);
+
+  if (dbError) return adminFail(res, dbError, 'notifications_stats_failed', 500);
+
+  return response(res, {
+    activeDevices: deviceCount || 0,
+    firebase: push.pushStatus(),
+  });
+});
+
+app.post('/api/admin/notifications', adminAuth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const title = notificationText(body.title, 'Title', 100);
+    const messageBody = notificationText(body.body, 'Message', 500);
+    const targetType = String(body.targetType || 'all').trim();
+
+    if (!NOTIFICATION_TARGETS.has(targetType)) {
+      return error(res, 400, 'Target must be all, user or topic.', 'notification_invalid');
+    }
+
+    let targetValue = null;
+    if (targetType === 'user') {
+      targetValue = notificationText(body.targetValue, 'User id', 200);
+    } else if (targetType === 'topic') {
+      targetValue = notificationText(body.targetValue || 'all', 'Topic', 100);
+    }
+
+    const sendNow = parseBoolean(body.sendNow, true);
+    let scheduledAt = now();
+
+    if (!sendNow) {
+      const when = new Date(body.scheduledAt || '');
+      if (Number.isNaN(when.getTime())) {
+        return error(res, 400, 'Pick a valid date and time for the schedule.', 'notification_invalid');
+      }
+      if (when.getTime() < Date.now() - 60000) {
+        return error(res, 400, 'Scheduled time must be in the future.', 'notification_invalid');
+      }
+      scheduledAt = when.toISOString();
+    }
+
+    const pushState = push.pushStatus();
+    if (sendNow && !pushState.configured) {
+      return error(res, 503, pushState.error || 'Firebase is not configured.', 'firebase_not_configured');
+    }
+
+    const { data: row, error: dbError } = await supabaseAdmin
+      .from('notifications')
+      .insert({
+        title,
+        body: messageBody,
+        image_url: optionalText(body.imageUrl),
+        target_type: targetType,
+        target_value: targetValue,
+        route: optionalText(body.route),
+        status: 'scheduled',
+        scheduled_at: scheduledAt,
+        created_by_email: req.user?.email || null,
+        updated_at: now(),
+      })
+      .select('*')
+      .single();
+
+    if (dbError) return adminFail(res, dbError, 'notification_create_failed', 500);
+
+    if (sendNow) {
+      try {
+        const sent = await push.claimAndSend(supabaseAdmin, row.id);
+        return response(res, mapNotification(sent || row));
+      } catch (sendError) {
+        return response(res, { ...mapNotification(row), status: 'failed', errorMessage: sendError.message });
+      }
+    }
+
+    return response(res, mapNotification(row), 201);
+  } catch (e) {
+    return error(res, e.status || 400, e.message, e.code || 'notification_invalid');
+  }
+});
+
+app.post('/api/admin/notifications/:id/send', adminAuth, async (req, res) => {
+  const notificationId = req.params.id;
+  const pushState = push.pushStatus();
+  if (!pushState.configured) {
+    return error(res, 503, pushState.error || 'Firebase is not configured.', 'firebase_not_configured');
+  }
+
+  const { error: resetError } = await supabaseAdmin
+    .from('notifications')
+    .update({ status: 'scheduled', scheduled_at: now(), error_message: null, updated_at: now() })
+    .eq('id', notificationId)
+    .in('status', ['failed', 'cancelled', 'scheduled']);
+
+  if (resetError) return adminFail(res, resetError, 'notification_send_failed', 500);
+
+  try {
+    const sent = await push.claimAndSend(supabaseAdmin, notificationId);
+    if (!sent) {
+      return error(res, 409, 'This notification is already being sent or was sent.', 'notification_not_sendable');
+    }
+    return response(res, mapNotification(sent));
+  } catch (e) {
+    return error(res, 500, e.message, 'notification_send_failed');
+  }
+});
+
+app.post('/api/admin/notifications/:id/cancel', adminAuth, async (req, res) => {
+  const { data, error: dbError } = await supabaseAdmin
+    .from('notifications')
+    .update({ status: 'cancelled', updated_at: now() })
+    .eq('id', req.params.id)
+    .eq('status', 'scheduled')
+    .select('*')
+    .maybeSingle();
+
+  if (dbError) return adminFail(res, dbError, 'notification_cancel_failed', 500);
+  if (!data) return error(res, 409, 'Only scheduled notifications can be cancelled.', 'notification_not_cancellable');
+  return response(res, mapNotification(data));
+});
+
+app.delete('/api/admin/notifications/:id', adminAuth, async (req, res) => {
+  const { data, error: dbError } = await supabaseAdmin
+    .from('notifications')
+    .delete()
+    .eq('id', req.params.id)
+    .neq('status', 'sending')
+    .select('id');
+
+  if (dbError) return adminFail(res, dbError, 'notification_delete_failed', 500);
+  if (!data || !data.length) {
+    return error(res, 409, 'Notification is being sent right now or was not found.', 'notification_not_deletable');
+  }
+  return response(res, { deleted: true });
+});
+
+
+/*
+|--------------------------------------------------------------------------
 | Error Handler
 |--------------------------------------------------------------------------
 */
@@ -9534,6 +9777,8 @@ const server = app.listen(
     console.log(
       'Authentication: Supabase Auth'
     );
+
+    push.startScheduler(supabaseAdmin);
   }
 );
 
