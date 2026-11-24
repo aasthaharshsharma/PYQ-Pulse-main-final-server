@@ -6741,8 +6741,10 @@ app.get('/api/admin/audit-logs', adminAuth, async (req, res) => {
       },
     });
   } catch (e) {
-    if (/audit_logs/i.test(String(e?.message || '')) || e?.code === '42P01' || e?.code === 'PGRST205') {
-      return error(res, 500, 'Audit log table is missing. Run audit_logs SQL (sql/2026-11-audit-logs.sql) in Supabase, then reload.', 'audit_table_missing');
+    // Only a real "table does not exist" error gets the table-missing message.
+    // Anything else (e.g. 42501 permission denied) shows the real Supabase error.
+    if (e?.code === '42P01' || e?.code === 'PGRST205') {
+      return error(res, 500, `Audit log table is missing. (${e.message || e.code})`, 'audit_table_missing');
     }
     return adminFail(res, e, 'admin_audit_logs_error', 500);
   }
