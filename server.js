@@ -666,6 +666,7 @@ const AUDIT_ENTITIES = {
   media: ['media upload', null],
   'site-controls': ['site controls', '__site_controls'],
   'draft-questions': ['draft question', 'draft_questions'],
+  'question-buckets': ['question bucket', 'question_buckets'],
   notifications: ['notification', 'notifications'],
 };
 
@@ -5875,6 +5876,897 @@ app.post('/api/admin/draft-questions/:id/publish', adminAuth, async (req, res) =
     return response(res, { published: 1, questionId: result.questionIds[0] || null });
   } catch (e) {
     return draftFail(res, e, 'admin_draft_publish_error');
+  }
+});
+
+// =========================================================
+// ADMIN - QUESTION BUCKETS
+// =========================================================
+
+const BUCKET_TYPES = ['csv', 'pdf', 'json', 'txt'];
+const BUCKET_LETTERS = ['A', 'B', 'C', 'D', 'E'];
+const BUCKET_PUBLISH_LIMIT = 15;
+
+const BUCKET_KEYS = {
+  questionid: 'questionId', qid: 'questionId', id: 'questionId', questioncode: 'questionId',
+  number: 'number', no: 'number', qno: 'number', questionno: 'number', questionnumber: 'number', sno: 'number', srno: 'number', serial: 'number',
+  question: 'stem', stem: 'stem', questiontext: 'stem', text: 'stem', parsedstem: 'stem',
+  optiona: 'A', opta: 'A', option1: 'A', a: 'A',
+  optionb: 'B', optb: 'B', option2: 'B', b: 'B',
+  optionc: 'C', optc: 'C', option3: 'C', c: 'C',
+  optiond: 'D', optd: 'D', option4: 'D', d: 'D',
+  optione: 'E', opte: 'E', option5: 'E', e: 'E',
+  correctoption: 'correctOption', answer: 'correctOption', correct: 'correctOption', key: 'correctOption', answerkey: 'correctOption', correctkey: 'correctOption', parsedanswer: 'correctOption', answeroption: 'correctOption',
+  correctanswer: 'correctAnswer', answertext: 'correctAnswer', correctanswertext: 'correctAnswer',
+  explanation: 'explanation', solution: 'explanation', explain: 'explanation',
+  printedkeyoption: 'printedKey', printedkey: 'printedKey', officialkey: 'printedKey', printedanswer: 'printedKey',
+  rationale: 'rationale',
+  subject: 'subject', subjectname: 'subject',
+  topic: 'topic', topicname: 'topic', chapter: 'topic',
+  subtopic: 'subtopic', subtopicname: 'subtopic',
+  examname: 'examName', exam: 'examName', examtitle: 'examName',
+  setname: 'setName', set: 'setName', paper: 'setName', papername: 'setName',
+  sourceyear: 'sourceYear', year: 'sourceYear',
+  questiontype: 'questionType', type: 'questionType',
+  active: 'active', isactive: 'active', enabled: 'active',
+  difficulty: 'difficulty', level: 'difficulty', difficultylevel: 'difficulty',
+  image: 'imageUrl', imageurl: 'imageUrl', img: 'imageUrl', imagelink: 'imageUrl',
+};
+
+const BUCKET_RAW_FIELDS = [
+  'number', 'questionId', 'stem', 'correctOption', 'correctAnswer', 'explanation', 'printedKey', 'rationale',
+  'subject', 'topic', 'subtopic', 'examName', 'setName', 'sourceYear', 'questionType', 'active', 'difficulty', 'imageUrl',
+];
+
+function bucketText(value) {
+  if (value === undefined || value === null) return '';
+  return String(value).replace(/ /g, ' ').trim();
+}
+
+function bucketNorm(value) {
+  return bucketText(value).toLowerCase().replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function bucketRawItem(input = {}, index = 0) {
+  const out = { options: {} };
+  const src = input && typeof input === 'object' ? input : {};
+  for (const [k, v] of Object.entries(src)) {
+    if (v === undefined || v === null) continue;
+    if (k === 'options' && typeof v === 'object') {
+      const list = Array.isArray(v) ? v : null;
+      for (let i = 0; i < BUCKET_LETTERS.length; i++) {
+        const L = BUCKET_LETTERS[i];
+        const val = list ? list[i] : v[L] ?? v[L.toLowerCase()];
+        if (bucketText(val)) out.options[L] = bucketText(val);
+      }
+      continue;
+    }
+    if (k === 'parsedOptions' && typeof v === 'object' && !Array.isArray(v)) {
+      for (const L of BUCKET_LETTERS) if (!out.options[L] && bucketText(v[L])) out.options[L] = bucketText(v[L]);
+      continue;
+    }
+    if (typeof v === 'object') continue;
+    const target = BUCKET_KEYS[String(k).toLowerCase().replace(/[^a-z0-9]/g, '')];
+    if (!target) continue;
+    if (BUCKET_LETTERS.includes(target)) {
+      if (!out.options[target] && bucketText(v)) out.options[target] = bucketText(v);
+    } else if (out[target] === undefined || out[target] === '') {
+      out[target] = bucketText(v);
+    }
+  }
+  const clean = { options: {} };
+  for (const L of BUCKET_LETTERS) if (out.options[L]) clean.options[L] = out.options[L];
+  for (const f of BUCKET_RAW_FIELDS) if (out[f] !== undefined && out[f] !== '') clean[f] = out[f];
+  if (!clean.number) clean.number = String(index + 1);
+  return clean;
+}
+
+function bucketAnswer(raw) {
+  const opts = raw.options || {};
+  const fromText = (text) => {
+    const t = bucketNorm(text);
+    if (!t) return '';
+    return BUCKET_LETTERS.find((L) => opts[L] && bucketNorm(opts[L]) === t) || '';
+  };
+  const c = bucketText(raw.correctOption);
+  if (/^[A-Ea-e]$/.test(c)) return c.toUpperCase();
+  const lead = c.match(/^(?:option|opt|ans|answer)?\s*[:\-]?\s*\(?([A-Ea-e])\)?(?:\s*[\).:\-].*)?$/i);
+  if (lead) return lead[1].toUpperCase();
+  if (/^[1-5]$/.test(c)) return BUCKET_LETTERS[Number(c) - 1];
+  return fromText(raw.correctAnswer) || fromText(c);
+}
+
+function bucketDifficulty(value) {
+  const t = bucketNorm(value);
+  if (!t) return null;
+  const n = Number(t);
+  if (Number.isFinite(n)) return Math.min(5, Math.max(1, Math.round(n)));
+  const words = { 'very easy': 1, easy: 2, medium: 3, moderate: 3, average: 3, hard: 4, difficult: 4, tough: 4, 'very hard': 5, 'very difficult': 5 };
+  return words[t] ?? null;
+}
+
+function bucketActive(value) {
+  const t = bucketNorm(value);
+  if (!t) return true;
+  if (['false', 'no', '0', 'disabled', 'disable', 'inactive', 'off', 'hidden'].includes(t)) return false;
+  return true;
+}
+
+function bucketYear(value) {
+  const m = bucketText(value).match(/\b(19[5-9]\d|20\d\d|2100)\b/);
+  return m ? Number(m[1]) : null;
+}
+
+function bucketQuestionId(value) {
+  const t = bucketText(value);
+  if (!t) return '';
+  if (/^(?:q|que|ques|question)?[\s._#-]*\d+$/i.test(t)) return '';
+  return t.slice(0, 120);
+}
+
+async function bucketContext() {
+  const [exams, sets, subjects, nodes] = await Promise.all([
+    supabaseAdmin.from('exams').select('id,name,code').order('name', { ascending: true }),
+    supabaseAdmin.from('sets').select('id,name,exam_id,year,set_type').order('created_at', { ascending: false }).limit(5000),
+    supabaseAdmin.from('subjects').select('id,name,exam_id').order('name', { ascending: true }).limit(5000),
+    supabaseAdmin.from('taxonomy_nodes').select('id,name,node_type,subject_id,exam_id,parent_id').order('name', { ascending: true }).limit(20000),
+  ]);
+  for (const r of [exams, sets, subjects, nodes]) if (r.error) throw r.error;
+  const ctx = {
+    exams: exams.data || [],
+    sets: sets.data || [],
+    subjects: subjects.data || [],
+    nodes: nodes.data || [],
+  };
+  ctx.examById = new Map(ctx.exams.map((x) => [String(x.id), x]));
+  ctx.setById = new Map(ctx.sets.map((x) => [String(x.id), x]));
+  ctx.subjectById = new Map(ctx.subjects.map((x) => [String(x.id), x]));
+  ctx.nodeById = new Map(ctx.nodes.map((x) => [String(x.id), x]));
+  return ctx;
+}
+
+function bucketFindExam(ctx, name) {
+  const n = bucketNorm(name);
+  if (!n) return null;
+  return ctx.exams.find((x) => bucketNorm(x.name) === n) || ctx.exams.find((x) => x.code && bucketNorm(x.code) === n) || null;
+}
+
+function bucketFindSet(ctx, name, examId, year) {
+  const n = bucketNorm(name);
+  if (!n) return null;
+  let list = ctx.sets.filter((x) => bucketNorm(x.name) === n);
+  if (examId) {
+    const inExam = list.filter((x) => String(x.exam_id) === String(examId));
+    if (inExam.length) list = inExam;
+  }
+  if (year && list.length > 1) {
+    const sameYear = list.filter((x) => Number(x.year) === Number(year));
+    if (sameYear.length) list = sameYear;
+  }
+  return list[0] || null;
+}
+
+function bucketTarget(ctx, target) {
+  if (!target || !target.type || target.type === 'none') return { examIds: [], setIds: [], labels: [] };
+  if (target.type === 'set') {
+    const set = ctx.setById.get(String(target.id));
+    if (!set) return null;
+    const exam = ctx.examById.get(String(set.exam_id));
+    return { examIds: set.exam_id ? [String(set.exam_id)] : [], setIds: [String(set.id)], labels: [exam?.name, set.name].filter(Boolean), year: set.year };
+  }
+  if (target.type === 'exam') {
+    const exam = ctx.examById.get(String(target.id));
+    if (!exam) return null;
+    return { examIds: [String(exam.id)], setIds: [], labels: [exam.name] };
+  }
+  return null;
+}
+
+function bucketResolveExam(ctx, raw, settings) {
+  const examName = bucketText(raw.examName);
+  const setName = bucketText(raw.setName);
+  const key = bucketNorm([examName, setName].filter(Boolean).join(' / '));
+  const label = [examName, setName].filter(Boolean).join(' / ');
+  const mapped = (settings.examMap || {})[key];
+  if (mapped) {
+    const t = bucketTarget(ctx, mapped);
+    if (t) return { ...t, key, label, status: 'mapped' };
+  }
+  if (!key) return { examIds: [], setIds: [], labels: [], key, label, status: 'blank' };
+
+  const year = bucketYear(raw.sourceYear);
+  const exam = bucketFindExam(ctx, examName);
+  if (setName) {
+    const set = bucketFindSet(ctx, setName, exam?.id, year);
+    if (set) return { ...bucketTarget(ctx, { type: 'set', id: set.id }), key, label, status: 'matched' };
+  }
+  if (exam && !setName) return { examIds: [String(exam.id)], setIds: [], labels: [exam.name], key, label, status: 'matched' };
+  if (examName && !exam) {
+    const set = bucketFindSet(ctx, examName, null, year);
+    if (set) return { ...bucketTarget(ctx, { type: 'set', id: set.id }), key, label, status: 'matched' };
+  }
+  return { examIds: [], setIds: [], labels: [], key, label, status: 'missing' };
+}
+
+function bucketFindSubject(ctx, name, examIds) {
+  const n = bucketNorm(name);
+  const list = ctx.subjects.filter((x) => bucketNorm(x.name) === n);
+  return (
+    list.find((x) => !x.exam_id) ||
+    list.find((x) => examIds.includes(String(x.exam_id))) ||
+    null
+  );
+}
+
+function bucketFindNode(ctx, subjectId, parentId, name) {
+  const n = bucketNorm(name);
+  const list = ctx.nodes.filter((x) => String(x.subject_id || '') === String(subjectId) && bucketNorm(x.name) === n);
+  return (
+    list.find((x) => String(x.parent_id || '') === String(parentId || '')) ||
+    (!parentId ? list.find((x) => String(x.node_type || '').toUpperCase() === 'TAG') : null) ||
+    null
+  );
+}
+
+function bucketResolveTaxonomy(ctx, raw, settings, examIds) {
+  const taxMap = settings.taxMap || {};
+  const auto = settings.autoCreateTaxonomy !== false;
+  const out = { subjectIds: [], topicIds: [], names: [], create: [], issues: [], entries: [] };
+  const s = bucketText(raw.subject);
+  const t = bucketText(raw.topic);
+  const st = bucketText(raw.subtopic);
+  if (!s) {
+    if (t || st) out.issues.push('Subject missing for topic');
+    return out;
+  }
+
+  const sKey = `subject|${bucketNorm(s)}`;
+  let subject = taxMap[sKey] ? ctx.subjectById.get(String(taxMap[sKey])) : null;
+  let sStatus = subject ? 'mapped' : '';
+  if (!subject) {
+    subject = bucketFindSubject(ctx, s, examIds);
+    sStatus = subject ? 'matched' : '';
+  }
+  if (!subject) {
+    const other = ctx.subjects.find((x) => bucketNorm(x.name) === bucketNorm(s));
+    if (other && !auto) out.issues.push(`Subject "${s}" belongs to another exam`);
+  }
+  out.entries.push({ key: sKey, kind: 'subject', name: s, parent: '', status: subject ? sStatus : auto ? 'new' : 'missing', id: subject ? String(subject.id) : '' });
+  if (!subject && !auto) out.issues.push(`Subject not found: ${s}`);
+  out.names.push(subject ? subject.name : s);
+  if (subject) out.subjectIds.push(String(subject.id));
+  else if (auto) out.create.push({ kind: 'subject', name: s, key: sKey });
+
+  if (!t) {
+    if (st) out.issues.push('Topic missing for sub-topic');
+    return out;
+  }
+  const tKey = `topic|${bucketNorm(s)}|${bucketNorm(t)}`;
+  let topic = subject && taxMap[tKey] ? ctx.nodeById.get(String(taxMap[tKey])) : null;
+  let tStatus = topic ? 'mapped' : '';
+  if (!topic && subject) {
+    topic = bucketFindNode(ctx, subject.id, null, t);
+    tStatus = topic ? 'matched' : '';
+  }
+  out.entries.push({ key: tKey, kind: 'topic', name: t, parent: s, subjectId: subject ? String(subject.id) : '', status: topic ? tStatus : auto ? 'new' : 'missing', id: topic ? String(topic.id) : '' });
+  if (!topic && !auto) out.issues.push(`Topic not found: ${t}`);
+  out.names.push(topic ? topic.name : t);
+  if (topic) out.topicIds.push(String(topic.id));
+  else if (auto) out.create.push({ kind: 'topic', name: t, key: tKey, subjectKey: sKey });
+
+  if (!st) return out;
+  const stKey = `subtopic|${bucketNorm(s)}|${bucketNorm(t)}|${bucketNorm(st)}`;
+  let sub = topic && taxMap[stKey] ? ctx.nodeById.get(String(taxMap[stKey])) : null;
+  let stStatus = sub ? 'mapped' : '';
+  if (!sub && topic) {
+    sub = bucketFindNode(ctx, subject.id, topic.id, st);
+    stStatus = sub ? 'matched' : '';
+  }
+  out.entries.push({ key: stKey, kind: 'subtopic', name: st, parent: `${s} › ${t}`, subjectId: subject ? String(subject.id) : '', topicId: topic ? String(topic.id) : '', status: sub ? stStatus : auto ? 'new' : 'missing', id: sub ? String(sub.id) : '' });
+  if (!sub && !auto) out.issues.push(`Sub-topic not found: ${st}`);
+  out.names.push(sub ? sub.name : st);
+  if (sub) out.topicIds.push(String(sub.id));
+  else if (auto) out.create.push({ kind: 'subtopic', name: st, key: stKey, topicKey: tKey, subjectKey: sKey });
+  return out;
+}
+
+function bucketResolveItem(ctx, row, settings = {}) {
+  const raw = row.raw || {};
+  const options = {};
+  for (const L of BUCKET_LETTERS) if (bucketText(raw.options?.[L])) options[L] = bucketText(raw.options[L]);
+  const questionType = (bucketText(raw.questionType) || 'MCQ').toUpperCase();
+  const correctOption = bucketAnswer(raw);
+  const stem = bucketText(raw.stem);
+  const issues = [];
+  if (!stem) issues.push('Question text missing');
+  if (questionType === 'MCQ') {
+    if (!['A', 'B', 'C', 'D'].every((L) => options[L])) issues.push('Options A-D incomplete');
+    if (!correctOption || !options[correctOption]) issues.push('Correct answer not set');
+  }
+
+  const exam = bucketResolveExam(ctx, raw, settings);
+  if (exam.status === 'missing') issues.push(`Exam / set not found: ${exam.label}`);
+  const tax = bucketResolveTaxonomy(ctx, raw, settings, exam.examIds);
+  issues.push(...tax.issues);
+
+  for (const id of tax.subjectIds) {
+    const subj = ctx.subjectById.get(id);
+    if (subj?.exam_id && exam.examIds.length && !exam.examIds.includes(String(subj.exam_id))) {
+      issues.push(`Subject "${subj.name}" belongs to another exam`);
+    }
+  }
+
+  const defaults = settings.defaults || {};
+  const difficulty = bucketDifficulty(raw.difficulty) ?? bucketDifficulty(defaults.difficulty) ?? 1;
+  const sourceYear = bucketYear(raw.sourceYear) ?? exam.year ?? bucketYear(defaults.sourceYear) ?? null;
+
+  const body = {
+    stem,
+    questionType,
+    options,
+    correctOption: correctOption || null,
+    explanation: bucketText(raw.explanation) || null,
+    difficulty,
+    sourceYear,
+    isActive: bucketActive(raw.active),
+    imageUrl: bucketText(raw.imageUrl) || null,
+    examIds: exam.examIds,
+    setIds: exam.setIds,
+    subjectIds: tax.subjectIds,
+    topicIds: tax.topicIds,
+  };
+  const qid = bucketQuestionId(raw.questionId);
+  if (qid) body.questionId = qid;
+
+  return {
+    body,
+    issues: [...new Set(issues)],
+    exam,
+    taxonomy: tax,
+    view: {
+      number: bucketText(raw.number),
+      questionId: qid || null,
+      examLabels: exam.labels,
+      examStatus: exam.status,
+      examText: exam.label,
+      subject: tax.names[0] || '',
+      topic: tax.names[1] || '',
+      subtopic: tax.names[2] || '',
+      newTaxonomy: tax.create.map((c) => c.name),
+      printedKey: bucketText(raw.printedKey) || null,
+      rationale: bucketText(raw.rationale) || null,
+      correctAnswer: bucketText(raw.correctAnswer) || null,
+    },
+  };
+}
+
+function bucketMapRow(row, resolved) {
+  return {
+    id: row.id,
+    position: row.position,
+    status: row.status,
+    error: row.error || null,
+    publishedId: row.question_id || null,
+    raw: row.raw || {},
+    stem: resolved.body.stem,
+    questionType: resolved.body.questionType,
+    options: resolved.body.options,
+    correctOption: resolved.body.correctOption,
+    explanation: resolved.body.explanation,
+    difficulty: resolved.body.difficulty,
+    sourceYear: resolved.body.sourceYear,
+    isActive: resolved.body.isActive,
+    imageUrl: resolved.body.imageUrl,
+    ready: row.status === 'published' ? true : resolved.issues.length === 0,
+    issues: row.status === 'published' ? [] : resolved.issues,
+    ...resolved.view,
+  };
+}
+
+function mapBucket(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    sourceType: row.source_type,
+    sourceFile: row.source_file || null,
+    status: row.status,
+    total: row.total_count || 0,
+    ready: row.ready_count || 0,
+    published: row.published_count || 0,
+    settings: row.settings || {},
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    publishedAt: row.published_at || null,
+    createdByEmail: row.created_by_email || null,
+  };
+}
+
+function bucketSettings(input = {}, base = {}) {
+  const out = { ...base };
+  if (input.autoCreateTaxonomy !== undefined) out.autoCreateTaxonomy = parseBoolean(input.autoCreateTaxonomy, true);
+  const cleanMap = (m) => {
+    const r = {};
+    for (const [k, v] of Object.entries(m && typeof m === 'object' ? m : {})) {
+      if (v === null || v === undefined || v === '') continue;
+      r[String(k)] = v;
+    }
+    return r;
+  };
+  if (input.examMap !== undefined) {
+    const r = {};
+    for (const [k, v] of Object.entries(cleanMap(input.examMap))) {
+      if (v && typeof v === 'object' && ['set', 'exam', 'none'].includes(v.type)) r[k] = { type: v.type, id: v.id ? String(v.id) : null };
+    }
+    out.examMap = r;
+  }
+  if (input.taxMap !== undefined) {
+    const r = {};
+    for (const [k, v] of Object.entries(cleanMap(input.taxMap))) r[k] = String(v);
+    out.taxMap = r;
+  }
+  if (input.defaults !== undefined) {
+    const d = input.defaults && typeof input.defaults === 'object' ? input.defaults : {};
+    out.defaults = {
+      difficulty: bucketDifficulty(d.difficulty),
+      sourceYear: bucketYear(d.sourceYear),
+    };
+  }
+  if (out.autoCreateTaxonomy === undefined) out.autoCreateTaxonomy = true;
+  return out;
+}
+
+async function bucketLoad(id) {
+  const { data, error: dbError } = await supabaseAdmin.from('question_buckets').select('*').eq('id', id).maybeSingle();
+  if (dbError) throw dbError;
+  if (!data) {
+    const err = new Error('Bucket not found. It may have been deleted.');
+    err.status = 404;
+    err.code = 'bucket_not_found';
+    throw err;
+  }
+  return data;
+}
+
+async function bucketItems(bucketId, extra) {
+  const rows = [];
+  for (let from = 0; ; from += 1000) {
+    let q = supabaseAdmin.from('question_bucket_items').select('*').eq('bucket_id', bucketId);
+    if (extra) q = extra(q);
+    const { data, error: dbError } = await q.order('position', { ascending: true }).range(from, from + 999);
+    if (dbError) throw dbError;
+    rows.push(...(data || []));
+    if (!data || data.length < 1000) break;
+  }
+  return rows;
+}
+
+async function bucketRefreshCounts(bucket, rows, ctx) {
+  const settings = bucket.settings || {};
+  const total = rows.length;
+  const published = rows.filter((r) => r.status === 'published').length;
+  const ready = rows.filter((r) => r.status !== 'published' && bucketResolveItem(ctx, r, settings).issues.length === 0).length;
+  const status = total && published === total ? 'published' : published ? 'partial' : 'draft';
+  const patch = { total_count: total, ready_count: ready, published_count: published, status };
+  if (status === 'published' && !bucket.published_at) patch.published_at = now();
+  const changed = Object.entries(patch).some(([k, v]) => bucket[k] !== v);
+  if (!changed) return bucket;
+  const { data, error: dbError } = await supabaseAdmin.from('question_buckets').update({ ...patch, updated_at: now() }).eq('id', bucket.id).select('*').maybeSingle();
+  if (dbError) throw dbError;
+  return data || { ...bucket, ...patch };
+}
+
+function bucketItemRows(bucketId, items, startPosition, ctx, settings) {
+  return items.map((item, i) => {
+    const raw = bucketRawItem(item, startPosition + i);
+    const resolved = bucketResolveItem(ctx, { raw }, settings);
+    return {
+      bucket_id: bucketId,
+      position: startPosition + i + 1,
+      raw,
+      stem: String(raw.stem || '').slice(0, 2000),
+      ready: resolved.issues.length === 0,
+      issues: resolved.issues,
+      status: 'pending',
+    };
+  });
+}
+
+function bucketMappingSummary(rowsResolved) {
+  const exams = new Map();
+  const tax = new Map();
+  for (const { row, resolved } of rowsResolved) {
+    if (row.status === 'published') continue;
+    const e = resolved.exam;
+    const cur = exams.get(e.key) || { key: e.key, name: e.label, status: e.status, labels: e.labels, count: 0 };
+    cur.count += 1;
+    exams.set(e.key, cur);
+    for (const t of resolved.taxonomy.entries) {
+      const entry = tax.get(t.key) || { ...t, count: 0 };
+      entry.count += 1;
+      tax.set(t.key, entry);
+    }
+  }
+  const order = { missing: 0, new: 1, blank: 2, mapped: 3, matched: 4 };
+  const sort = (a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9) || String(a.name).localeCompare(String(b.name));
+  return { exams: [...exams.values()].sort(sort), taxonomy: [...tax.values()].sort(sort) };
+}
+
+function bucketFail(res, e, code) {
+  const msg = String(e?.message || '');
+  if (/question_bucket/.test(msg) && /(exist|schema cache|find)/i.test(msg)) {
+    return error(res, 500, `Question bucket tables are missing. Run question_buckets.sql in Supabase. (${msg})`, 'bucket_table_missing');
+  }
+  return adminFail(res, e, code);
+}
+
+app.get('/api/admin/question-buckets', adminAuth, async (req, res) => {
+  try {
+    const { data, error: dbError } = await supabaseAdmin.from('question_buckets').select('*').order('created_at', { ascending: false }).limit(500);
+    if (dbError) throw dbError;
+    return response(res, { buckets: (data || []).map(mapBucket) });
+  } catch (e) {
+    return bucketFail(res, e, 'admin_buckets_list_error');
+  }
+});
+
+app.post('/api/admin/question-buckets', adminAuth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const name = requiredText(body.name, 'Bucket name');
+    const sourceType = String(body.sourceType || 'csv').toLowerCase();
+    if (!BUCKET_TYPES.includes(sourceType)) return error(res, 400, 'File type must be CSV, PDF or JSON.', 'bucket_type');
+    const items = Array.isArray(body.items) ? body.items : [];
+    if (items.length > 500) return error(res, 400, 'Send at most 500 questions per request.', 'bucket_limit');
+    const settings = bucketSettings(body.settings || {}, {});
+
+    const { data: bucket, error: dbError } = await supabaseAdmin
+      .from('question_buckets')
+      .insert({
+        name: name.slice(0, 200),
+        source_type: sourceType,
+        source_file: optionalText(body.sourceFile),
+        settings,
+        created_by: req.user?.id || null,
+        created_by_email: req.user?.email || null,
+      })
+      .select('*')
+      .single();
+    if (dbError) throw dbError;
+
+    if (items.length) {
+      try {
+        const ctx = await bucketContext();
+        const rows = bucketItemRows(bucket.id, items, 0, ctx, settings);
+        const { error: insError } = await supabaseAdmin.from('question_bucket_items').insert(rows);
+        if (insError) throw insError;
+        await bucketRefreshCounts(bucket, await bucketItems(bucket.id), ctx);
+      } catch (e) {
+        await supabaseAdmin.from('question_buckets').delete().eq('id', bucket.id);
+        throw e;
+      }
+    }
+    res.locals.audit = { action: 'create', entityId: bucket.id, summary: `Created question bucket "${bucket.name}" with ${items.length} question(s)` };
+    return response(res, { bucket: mapBucket(await bucketLoad(bucket.id)) }, 201);
+  } catch (e) {
+    return bucketFail(res, e, 'admin_bucket_create_error');
+  }
+});
+
+app.post('/api/admin/question-buckets/:id/items', adminAuth, async (req, res) => {
+  try {
+    const bucket = await bucketLoad(req.params.id);
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!items.length) return error(res, 400, 'No questions supplied.', 'questions_required');
+    if (items.length > 500) return error(res, 400, 'Send at most 500 questions per request.', 'bucket_limit');
+    const { data: last, error: lastError } = await supabaseAdmin
+      .from('question_bucket_items')
+      .select('position')
+      .eq('bucket_id', bucket.id)
+      .order('position', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (lastError) throw lastError;
+    const ctx = await bucketContext();
+    const rows = bucketItemRows(bucket.id, items, Number(last?.position || 0), ctx, bucket.settings || {});
+    const { error: insError } = await supabaseAdmin.from('question_bucket_items').insert(rows);
+    if (insError) throw insError;
+    const updated = await bucketRefreshCounts(bucket, await bucketItems(bucket.id), ctx);
+    res.locals.audit = { action: 'update', entityId: bucket.id, summary: `Added ${rows.length} question(s) to bucket "${bucket.name}"` };
+    return response(res, { added: rows.length, bucket: mapBucket(updated) }, 201);
+  } catch (e) {
+    return bucketFail(res, e, 'admin_bucket_items_add_error');
+  }
+});
+
+app.get('/api/admin/question-buckets/:id', adminAuth, async (req, res) => {
+  try {
+    let bucket = await bucketLoad(req.params.id);
+    const [rows, ctx] = await Promise.all([bucketItems(bucket.id), bucketContext()]);
+    bucket = await bucketRefreshCounts(bucket, rows, ctx);
+    const settings = bucket.settings || {};
+    const resolvedRows = rows.map((row) => ({ row, resolved: bucketResolveItem(ctx, row, settings) }));
+    return response(res, {
+      bucket: mapBucket(bucket),
+      items: resolvedRows.map(({ row, resolved }) => bucketMapRow(row, resolved)),
+      mapping: bucketMappingSummary(resolvedRows),
+      options: {
+        exams: ctx.exams.map((x) => ({ id: x.id, name: x.name })),
+        sets: ctx.sets.map((x) => ({ id: x.id, name: x.name, examId: x.exam_id, year: x.year, setType: x.set_type })),
+        subjects: ctx.subjects.map((x) => ({ id: x.id, name: x.name, examId: x.exam_id })),
+        taxonomy: ctx.nodes.map((x) => ({ id: x.id, name: x.name, subjectId: x.subject_id, parentId: x.parent_id, nodeType: x.node_type })),
+      },
+    });
+  } catch (e) {
+    return bucketFail(res, e, 'admin_bucket_get_error');
+  }
+});
+
+app.patch('/api/admin/question-buckets/:id', adminAuth, async (req, res) => {
+  try {
+    const bucket = await bucketLoad(req.params.id);
+    const body = req.body || {};
+    const update = { updated_at: now() };
+    if (body.name !== undefined) update.name = requiredText(body.name, 'Bucket name').slice(0, 200);
+    if (body.settings !== undefined) update.settings = bucketSettings(body.settings || {}, bucket.settings || {});
+    const { data, error: dbError } = await supabaseAdmin.from('question_buckets').update(update).eq('id', bucket.id).select('*').maybeSingle();
+    if (dbError) throw dbError;
+    const ctx = await bucketContext();
+    const refreshed = await bucketRefreshCounts(data, await bucketItems(bucket.id), ctx);
+    return response(res, { bucket: mapBucket(refreshed) });
+  } catch (e) {
+    return bucketFail(res, e, 'admin_bucket_update_error');
+  }
+});
+
+app.delete('/api/admin/question-buckets/:id', adminAuth, async (req, res) => {
+  try {
+    const bucket = await bucketLoad(req.params.id);
+    const { error: dbError } = await supabaseAdmin.from('question_buckets').delete().eq('id', bucket.id);
+    if (dbError) throw dbError;
+    res.locals.audit = { action: 'delete', entityId: bucket.id, summary: `Deleted question bucket "${bucket.name}"` };
+    return response(res, { deleted: 1 });
+  } catch (e) {
+    return bucketFail(res, e, 'admin_bucket_delete_error');
+  }
+});
+
+app.patch('/api/admin/question-buckets/:id/items/:itemId', adminAuth, async (req, res) => {
+  try {
+    const bucket = await bucketLoad(req.params.id);
+    const { data: row, error: loadError } = await supabaseAdmin
+      .from('question_bucket_items')
+      .select('*')
+      .eq('id', req.params.itemId)
+      .eq('bucket_id', bucket.id)
+      .maybeSingle();
+    if (loadError) throw loadError;
+    if (!row) return error(res, 404, 'Question not found in this bucket.', 'bucket_item_not_found');
+    if (row.status === 'published') return error(res, 400, 'This question is already published. Edit it from the Question Bank.', 'bucket_item_published');
+
+    const body = req.body || {};
+    const merged = { ...(row.raw || {}), options: { ...(row.raw?.options || {}) } };
+    for (const f of BUCKET_RAW_FIELDS) {
+      if (body[f] === undefined) continue;
+      const v = bucketText(body[f]);
+      if (v) merged[f] = v;
+      else delete merged[f];
+    }
+    if (body.options && typeof body.options === 'object') {
+      merged.options = {};
+      for (const L of BUCKET_LETTERS) if (bucketText(body.options[L])) merged.options[L] = bucketText(body.options[L]);
+    }
+    if (body.correctOption !== undefined) delete merged.correctAnswer;
+    const raw = bucketRawItem(merged, Number(row.position || 1) - 1);
+    if (merged.number) raw.number = merged.number;
+
+    const ctx = await bucketContext();
+    const resolved = bucketResolveItem(ctx, { raw }, bucket.settings || {});
+    const { data, error: dbError } = await supabaseAdmin
+      .from('question_bucket_items')
+      .update({ raw, stem: String(raw.stem || '').slice(0, 2000), ready: resolved.issues.length === 0, issues: resolved.issues, status: 'pending', error: null, updated_at: now() })
+      .eq('id', row.id)
+      .select('*')
+      .maybeSingle();
+    if (dbError) throw dbError;
+    await bucketRefreshCounts(bucket, await bucketItems(bucket.id), ctx);
+    return response(res, { item: bucketMapRow(data, resolved) });
+  } catch (e) {
+    return bucketFail(res, e, 'admin_bucket_item_update_error');
+  }
+});
+
+app.post('/api/admin/question-buckets/:id/items/delete', adminAuth, async (req, res) => {
+  try {
+    const bucket = await bucketLoad(req.params.id);
+    const ids = draftIdList(req.body?.ids);
+    if (!ids.length) return error(res, 400, 'Select at least one question.', 'ids_required');
+    const { data, error: dbError } = await supabaseAdmin
+      .from('question_bucket_items')
+      .delete()
+      .eq('bucket_id', bucket.id)
+      .neq('status', 'published')
+      .in('id', ids)
+      .select('id');
+    if (dbError) throw dbError;
+    const ctx = await bucketContext();
+    const updated = await bucketRefreshCounts(bucket, await bucketItems(bucket.id), ctx);
+    res.locals.audit = { action: 'update', entityId: bucket.id, summary: `Removed ${data?.length || 0} question(s) from bucket "${bucket.name}"` };
+    return response(res, { deleted: data?.length || 0, bucket: mapBucket(updated) });
+  } catch (e) {
+    return bucketFail(res, e, 'admin_bucket_items_delete_error');
+  }
+});
+
+async function bucketInsertSubject(ctx, name) {
+  const payload = {
+    id: await generatedTextId('subjects', `root-${name}`, 'subject'),
+    name,
+    exam_id: null,
+    question_count: 0,
+    node_type: 'SUBJECT',
+    slug: slugify(name, 'subject'),
+    display_order: 0,
+  };
+  const { data, error: dbError } = await supabaseAdmin.from('subjects').insert(payload).select('id,name,exam_id').single();
+  if (dbError) throw dbError;
+  ctx.subjects.push(data);
+  ctx.subjectById.set(String(data.id), data);
+  return data;
+}
+
+async function bucketInsertNode(ctx, name, subjectId, parentId, nodeType) {
+  const payload = {
+    id: await generatedTextId('taxonomy_nodes', `${subjectId}-${name}`, 'node'),
+    parent_id: parentId,
+    subject_id: subjectId,
+    exam_id: null,
+    name,
+    node_type: nodeType,
+    slug: slugify(name, 'node'),
+    display_order: 0,
+  };
+  const { data, error: dbError } = await supabaseAdmin.from('taxonomy_nodes').insert(payload).select('id,name,node_type,subject_id,exam_id,parent_id').single();
+  if (dbError) throw dbError;
+  ctx.nodes.push(data);
+  ctx.nodeById.set(String(data.id), data);
+  return data;
+}
+
+async function bucketEnsureTaxonomy(ctx, raws, settings) {
+  const taxMap = settings.taxMap || {};
+  let created = 0;
+  for (const raw of raws) {
+    const s = bucketText(raw.subject);
+    const t = bucketText(raw.topic);
+    const st = bucketText(raw.subtopic);
+    if (!s) continue;
+    const exam = bucketResolveExam(ctx, raw, settings);
+    const sKey = `subject|${bucketNorm(s)}`;
+    let subject = taxMap[sKey] ? ctx.subjectById.get(String(taxMap[sKey])) : null;
+    if (!subject) subject = bucketFindSubject(ctx, s, exam.examIds);
+    if (!subject) {
+      subject = await bucketInsertSubject(ctx, s);
+      created += 1;
+    }
+    if (!t) continue;
+    const tKey = `topic|${bucketNorm(s)}|${bucketNorm(t)}`;
+    let topic = taxMap[tKey] ? ctx.nodeById.get(String(taxMap[tKey])) : null;
+    if (!topic) topic = bucketFindNode(ctx, subject.id, null, t);
+    if (!topic) {
+      topic = await bucketInsertNode(ctx, t, String(subject.id), null, 'TAG');
+      created += 1;
+    }
+    if (!st) continue;
+    const stKey = `subtopic|${bucketNorm(s)}|${bucketNorm(t)}|${bucketNorm(st)}`;
+    let sub = taxMap[stKey] ? ctx.nodeById.get(String(taxMap[stKey])) : null;
+    if (!sub) sub = bucketFindNode(ctx, subject.id, topic.id, st);
+    if (!sub) {
+      await bucketInsertNode(ctx, st, String(subject.id), String(topic.id), 'SUBTAG');
+      created += 1;
+    }
+  }
+  return created;
+}
+
+app.post('/api/admin/question-buckets/:id/publish', adminAuth, async (req, res) => {
+  try {
+    const bucket = await bucketLoad(req.params.id);
+    const settings = bucket.settings || {};
+    const cursor = Math.max(0, Math.floor(number(req.body?.cursor, 0)));
+    const limit = Math.min(BUCKET_PUBLISH_LIMIT, Math.max(1, Math.floor(number(req.body?.limit, BUCKET_PUBLISH_LIMIT))));
+    const onlyIds = draftIdList(req.body?.ids);
+
+    let q = supabaseAdmin
+      .from('question_bucket_items')
+      .select('*')
+      .eq('bucket_id', bucket.id)
+      .neq('status', 'published')
+      .gt('position', cursor)
+      .order('position', { ascending: true })
+      .limit(limit);
+    if (onlyIds.length) q = q.in('id', onlyIds);
+    const { data: rows, error: loadError } = await q;
+    if (loadError) throw loadError;
+
+    const ctx = await bucketContext();
+    const failed = [];
+    let published = 0;
+    let skipped = 0;
+    const candidates = [];
+    for (const row of rows || []) {
+      const resolved = bucketResolveItem(ctx, row, settings);
+      const blocking = resolved.issues;
+      if (blocking.length) {
+        skipped += 1;
+        failed.push({ id: row.id, stem: String(row.raw?.stem || '').slice(0, 120), error: blocking.join(', ') });
+        continue;
+      }
+      candidates.push(row);
+    }
+
+    let createdTaxonomy = 0;
+    if (candidates.length && settings.autoCreateTaxonomy !== false) {
+      createdTaxonomy = await bucketEnsureTaxonomy(ctx, candidates.map((r) => r.raw || {}), settings);
+    }
+
+    for (const row of candidates) {
+      const resolved = bucketResolveItem(ctx, row, settings);
+      if (resolved.issues.length || resolved.taxonomy.create.length) {
+        const reason = resolved.issues.length ? resolved.issues.join(', ') : 'Taxonomy could not be created';
+        failed.push({ id: row.id, stem: String(row.raw?.stem || '').slice(0, 120), error: reason });
+        await supabaseAdmin.from('question_bucket_items').update({ status: 'failed', error: reason, updated_at: now() }).eq('id', row.id);
+        continue;
+      }
+      const body = { ...resolved.body };
+      if (body.options) {
+        const o = {};
+        for (const [k, v] of Object.entries(body.options)) if (String(v || '').trim()) o[k] = String(v).trim();
+        body.options = o;
+      }
+      try {
+        const question = await createQuestionFromBody(body);
+        published += 1;
+        await supabaseAdmin
+          .from('question_bucket_items')
+          .update({ status: 'published', error: null, question_id: question?.id ? String(question.id) : null, ready: true, issues: [], updated_at: now() })
+          .eq('id', row.id);
+      } catch (e) {
+        const reason = e?.code === '23505' || /duplicate key/i.test(String(e?.message || ''))
+          ? `Question ID "${body.questionId || ''}" already exists in the question bank`
+          : e?.message || 'Upload failed.';
+        failed.push({ id: row.id, stem: String(body.stem || '').slice(0, 120), error: reason });
+        await supabaseAdmin.from('question_bucket_items').update({ status: 'failed', error: reason, updated_at: now() }).eq('id', row.id);
+      }
+    }
+
+    const nextCursor = rows && rows.length ? Number(rows[rows.length - 1].position) : cursor;
+    let remainingQuery = supabaseAdmin
+      .from('question_bucket_items')
+      .select('id', { count: 'exact', head: true })
+      .eq('bucket_id', bucket.id)
+      .neq('status', 'published')
+      .gt('position', nextCursor);
+    if (onlyIds.length) remainingQuery = remainingQuery.in('id', onlyIds);
+    const { count: remaining, error: countError } = await remainingQuery;
+    if (countError) throw countError;
+
+    const updated = await bucketRefreshCounts(await bucketLoad(bucket.id), await bucketItems(bucket.id), ctx);
+    res.locals.audit = {
+      action: 'create',
+      entityId: bucket.id,
+      summary: `Published ${published} question(s) from bucket "${bucket.name}"${failed.length ? `, ${failed.length} need fixing` : ''}`,
+    };
+    return response(res, {
+      published,
+      skipped,
+      failed,
+      createdTaxonomy,
+      cursor: nextCursor,
+      remaining: remaining || 0,
+      bucket: mapBucket(updated),
+    });
+  } catch (e) {
+    return bucketFail(res, e, 'admin_bucket_publish_error');
   }
 });
 
